@@ -34,7 +34,9 @@ class Assistant(Agent):
             You can answer questions about company policies, benefits, leave requests, payroll, and other HR matters.
             When users ask HR questions, use the query_hr_system function to get accurate, up-to-date information from the HR system.
             Your responses should be helpful, professional, and concise. Speak naturally and conversationally.
-            If you don't have specific information, let the user know you're looking it up for them.""",
+            If you don't have specific information, let the user know you're looking it up for them.
+            
+            IMPORTANT: When a user first connects to the session, immediately greet them with: "Hello! I'm your HR assistant. How can I help you today? You can ask me about company policies, benefits, leave requests, or any other HR-related questions." This greeting should be the first thing you say when someone joins.""",
         )
 
     # all functions annotated with @function_tool will be passed to the LLM when this
@@ -124,11 +126,6 @@ async def entrypoint(ctx: JobContext):
 
     # Join the room and connect to the user
     await ctx.connect()
-    
-    # Send a welcome message when the session starts
-    welcome_message = "Hello! I'm your HR assistant. How can I help you today? You can ask me about company policies, benefits, leave requests, or any other HR-related questions."
-    logger.info("Sending welcome message to user")
-    await session.say(welcome_message, allow_interruptions=True)
 
 
 # Health check app for deployment

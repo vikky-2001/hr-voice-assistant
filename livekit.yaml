@@ -1,0 +1,53 @@
+# LiveKit Cloud deployment configuration
+apiVersion: v1
+kind: Agent
+metadata:
+  name: hr-voice-assistant
+  namespace: default
+spec:
+  # Agent configuration
+  image: hr-voice-assistant:latest
+  replicas: 1
+  
+  # Environment variables
+  env:
+    - name: OPENAI_API_KEY
+      valueFrom:
+        secretKeyRef:
+          name: hr-assistant-secrets
+          key: openai-api-key
+    - name: LIVEKIT_URL
+      value: "wss://mobile-worker-o314phth.livekit.cloud"
+    - name: LIVEKIT_API_KEY
+      valueFrom:
+        secretKeyRef:
+          name: hr-assistant-secrets
+          key: livekit-api-key
+    - name: LIVEKIT_API_SECRET
+      valueFrom:
+        secretKeyRef:
+          name: hr-assistant-secrets
+          key: livekit-api-secret
+  
+  # Resource limits
+  resources:
+    requests:
+      memory: "512Mi"
+      cpu: "250m"
+    limits:
+      memory: "1Gi"
+      cpu: "500m"
+  
+  # Health check
+  livenessProbe:
+    httpGet:
+      path: /health
+      port: 8080
+    initialDelaySeconds: 30
+    periodSeconds: 10
+  
+  # Auto-scaling
+  autoscaling:
+    minReplicas: 1
+    maxReplicas: 3
+    targetCPUUtilizationPercentage: 70

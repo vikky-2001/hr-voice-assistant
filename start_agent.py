@@ -5,6 +5,7 @@ Simple startup script for HR Voice Assistant
 
 import subprocess
 import sys
+import os
 from pathlib import Path
 
 def main():
@@ -13,7 +14,7 @@ def main():
     print("=" * 50)
     
     # Check if required files exist
-    agent_path = Path("agent-starter-python/src/agent.py")
+    agent_path = Path("agent.py")
     venv_python = Path("venv/Scripts/python.exe")
     
     if not agent_path.exists():
@@ -32,11 +33,22 @@ def main():
     print("\nPress Ctrl+C to stop the agent...")
     print("=" * 50)
     
+    # Set environment variables from secrets.env if it exists
+    env = os.environ.copy()
+    secrets_file = Path("secrets.env")
+    if secrets_file.exists():
+        with open(secrets_file, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#') and '=' in line:
+                    key, value = line.split('=', 1)
+                    env[key] = value
+    
     try:
         # Start the agent in development mode
         subprocess.run([
             str(venv_python), str(agent_path), "dev"
-        ])
+        ], env=env)
     except KeyboardInterrupt:
         print("\n🛑 Shutting down HR Voice Assistant...")
         print("👋 Goodbye!")

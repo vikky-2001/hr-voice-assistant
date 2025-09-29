@@ -13,6 +13,7 @@ from livekit.agents import (
     cli,
     function_tool,
 )
+from livekit import rtc
 from livekit.plugins import openai, silero
 import httpx
 from fastapi import FastAPI
@@ -25,6 +26,29 @@ HR_API_ENDPOINT = "/getBotResponse"
 logger = logging.getLogger("agent")
 
 load_dotenv(".env.local")
+
+async def send_text_to_frontend(session: AgentSession, message_type: str, content: str, metadata: dict = None):
+    """Send structured text data to the frontend via LiveKit data channel"""
+    try:
+        import json
+        
+        data = {
+            "type": message_type,
+            "content": content,
+            "timestamp": datetime.now().isoformat(),
+            "metadata": metadata or {}
+        }
+        
+        # Send as data message to all participants
+        await session.room.local_participant.publish_data(
+            data=json.dumps(data).encode('utf-8'),
+            topic="chat"
+        )
+        
+        logger.info(f"Sent {message_type} to frontend: {content[:100]}...")
+        
+    except Exception as e:
+        logger.error(f"Error sending text to frontend: {e}")
 
 
 class Assistant(Agent):
@@ -86,6 +110,18 @@ class Assistant(Agent):
                 
                 logger.info(f"Daily briefing received: {briefing_response[:100]}...")
                 logger.info("=== get_daily_briefing() function completed successfully ===")
+                
+                # Send daily briefing to frontend
+                try:
+                    await send_text_to_frontend(
+                        session=getattr(self, '_session', None),
+                        message_type="daily_briefing",
+                        content=briefing_response,
+                        metadata={"source": "hr_api", "query": "System trigger: daily briefing"}
+                    )
+                except Exception as e:
+                    logger.error(f"Error sending daily briefing to frontend: {e}")
+                
                 return briefing_response
             
         except httpx.HTTPStatusError as e:
@@ -180,11 +216,27 @@ async def entrypoint(ctx: JobContext):
     def _on_agent_false_interruption(ev):
         logger.info("false positive interruption, resuming")
         session.generate_reply(instructions=ev.extra_instructions or None)
+    
+    # Send agent responses to frontend as text
+    @session.on("agent_speech_committed")
+    async def _on_agent_speech_committed(ev):
+        logger.info(f"Agent speech committed: {ev.text}")
+        try:
+            await send_text_to_frontend(
+                session=session,
+                message_type="agent_response",
+                content=ev.text,
+                metadata={"source": "agent_speech", "timestamp": ev.timestamp}
+            )
+        except Exception as e:
+            logger.error(f"Error sending agent response to frontend: {e}")
 
     # Start the session, which initializes the voice pipeline and warms up the models
     logger.info("Starting AgentSession...")
+    assistant = Assistant()
+    assistant._session = session  # Pass session to assistant for frontend communication
     await session.start(
-        agent=Assistant(),
+        agent=assistant,
         room=ctx.room,
         # Simplified setup without noise cancellation for testing
     )

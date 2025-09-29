@@ -219,15 +219,15 @@ async def entrypoint(ctx: JobContext):
     
     # Send agent responses to frontend as text
     @session.on("agent_speech_committed")
-    async def _on_agent_speech_committed(ev):
+    def _on_agent_speech_committed(ev):
         logger.info(f"Agent speech committed: {ev.text}")
         try:
-            await send_text_to_frontend(
+            asyncio.create_task(send_text_to_frontend(
                 session=session,
                 message_type="agent_response",
                 content=ev.text,
                 metadata={"source": "agent_speech", "timestamp": ev.timestamp}
-            )
+            ))
         except Exception as e:
             logger.error(f"Error sending agent response to frontend: {e}")
 

@@ -113,12 +113,16 @@ class Assistant(Agent):
                 
                 # Send daily briefing to frontend
                 try:
-                    await send_text_to_frontend(
-                        session=getattr(self, '_session', None),
-                        message_type="daily_briefing",
-                        content=briefing_response,
-                        metadata={"source": "hr_api", "query": "System trigger: daily briefing"}
-                    )
+                    session = getattr(self, '_session', None)
+                    if session and hasattr(session, 'room') and session.room:
+                        await send_text_to_frontend(
+                            session=session,
+                            message_type="daily_briefing",
+                            content=briefing_response,
+                            metadata={"source": "hr_api", "query": "System trigger: daily briefing"}
+                        )
+                    else:
+                        logger.warning("Session or room not available for sending daily briefing to frontend")
                 except Exception as e:
                     logger.error(f"Error sending daily briefing to frontend: {e}")
                 
@@ -222,12 +226,15 @@ async def entrypoint(ctx: JobContext):
     def _on_agent_speech_committed(ev):
         logger.info(f"Agent speech committed: {ev.text}")
         try:
-            asyncio.create_task(send_text_to_frontend(
-                session=session,
-                message_type="agent_response",
-                content=ev.text,
-                metadata={"source": "agent_speech", "timestamp": ev.timestamp}
-            ))
+            if hasattr(session, 'room') and session.room:
+                asyncio.create_task(send_text_to_frontend(
+                    session=session,
+                    message_type="agent_response",
+                    content=ev.text,
+                    metadata={"source": "agent_speech", "timestamp": ev.timestamp}
+                ))
+            else:
+                logger.warning("Session room not available for sending agent response to frontend")
         except Exception as e:
             logger.error(f"Error sending agent response to frontend: {e}")
 

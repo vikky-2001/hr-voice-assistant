@@ -77,3 +77,35 @@ logs/
 .mypy_cache/
 .dmypy.json
 dmypy.json
+
+# Additional cache and temporary files
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+.coverage
+htmlcov/
+.tox/
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+
+# Test files
+test_*.py
+*_test.py
+tests/
+
+# Documentation
+docs/_build/
+
+# Backup files
+*.bak
+*.backup
+*~
+
+# Local development
+.local/
+.cache/

@@ -211,6 +211,8 @@ async def entrypoint(ctx: JobContext):
         tts=openai.TTS(model="tts-1", voice="alloy"),
         # VAD for voice activity detection
         vad=ctx.proc.userdata["vad"],
+        # Enable transcript events for live transcription
+        enable_transcription=True,
     )
     logger.info("AgentSession created successfully")
 
@@ -237,6 +239,21 @@ async def entrypoint(ctx: JobContext):
                 logger.warning("Session room not available for sending agent response to frontend")
         except Exception as e:
             logger.error(f"Error sending agent response to frontend: {e}")
+
+    # Send agent speech start notification
+    @session.on("agent_speech_started")
+    def _on_agent_speech_started(ev):
+        logger.info("Agent started speaking")
+        try:
+            if hasattr(session, 'room') and session.room:
+                asyncio.create_task(send_text_to_frontend(
+                    session=session,
+                    message_type="agent_speaking",
+                    content="Agent is speaking...",
+                    metadata={"source": "agent_speech_start", "timestamp": ev.timestamp}
+                ))
+        except Exception as e:
+            logger.error(f"Error sending agent speech start to frontend: {e}")
 
     # Start the session, which initializes the voice pipeline and warms up the models
     logger.info("Starting AgentSession...")

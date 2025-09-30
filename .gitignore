@@ -109,3 +109,11 @@ docs/_build/
 # Local development
 .local/
 .cache/
+
+# Frontend files
+frontend_example.html
+flutter_text_display_example.dart
+*.html
+*.dart
+frontend/
+web/

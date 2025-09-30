@@ -243,8 +243,6 @@ async def entrypoint(ctx: JobContext):
         tts=openai.TTS(model="tts-1", voice="alloy"),
         # VAD for voice activity detection
         vad=ctx.proc.userdata["vad"],
-        # Enable transcript events for live transcription
-        enable_transcription=True,
     )
     logger.info("AgentSession created successfully")
 

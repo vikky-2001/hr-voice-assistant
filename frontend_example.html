@@ -89,6 +89,16 @@
             border-left: 4px solid #ff9800;
             font-style: italic;
         }
+        .message.speaking {
+            background-color: #e8f5e8;
+            border-left: 4px solid #4caf50;
+            font-style: italic;
+            animation: pulse 1.5s ease-in-out infinite alternate;
+        }
+        @keyframes pulse {
+            from { opacity: 0.7; }
+            to { opacity: 1; }
+        }
         .message-time {
             font-size: 12px;
             color: #666;
@@ -295,6 +305,13 @@
                     
                     if (data.type === 'daily_briefing') {
                         showDailyBriefing(data.content);
+                    } else if (data.type === 'agent_response') {
+                        // Display agent response in both conversation and live transcript
+                        addMessage(data.content, 'agent', 'conversation');
+                        addMessage(data.content, 'agent', 'liveTranscript');
+                    } else if (data.type === 'agent_speaking') {
+                        // Show that agent is speaking in live transcript
+                        addMessage(data.content, 'speaking', 'liveTranscript');
                     } else if (data.type === 'message') {
                         addMessage(data.content, participant.identity.includes('agent') ? 'agent' : 'user');
                     }

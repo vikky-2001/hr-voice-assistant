@@ -103,7 +103,18 @@ class Assistant(Agent):
         logger.info("=== get_daily_briefing() function called ===")
         logger.info("Getting daily briefing from HR system")
 
-        # Note: Loading message will be spoken by the agent, not sent as text
+        # Send loading message to frontend as text (agent will also speak it)
+        try:
+            session = getattr(self, '_session', None)
+            if session and hasattr(session, 'room') and session.room:
+                await send_text_to_frontend(
+                    session=session,
+                    message_type="loading",
+                    content="Preparing your daily HR briefing...",
+                    metadata={"source": "hr_api", "query": "System trigger: daily briefing", "status": "loading"}
+                )
+        except Exception as e:
+            logger.error(f"Error sending loading message to frontend: {e}")
 
         try:
             # Call the HR API for daily briefing with hardcoded user and chatlog IDs
@@ -173,7 +184,18 @@ class Assistant(Agent):
 
         logger.info(f"Querying HR system: {query}")
 
-        # Note: Loading message will be spoken by the agent, not sent as text
+        # Send loading message to frontend as text (agent will also speak it)
+        try:
+            session = getattr(self, '_session', None)
+            if session and hasattr(session, 'room') and session.room:
+                await send_text_to_frontend(
+                    session=session,
+                    message_type="loading",
+                    content="Let me check that information for you...",
+                    metadata={"source": "hr_api", "query": query, "status": "loading"}
+                )
+        except Exception as e:
+            logger.error(f"Error sending loading message to frontend: {e}")
 
         try:
             # Call the HR API directly with hardcoded user and chatlog IDs

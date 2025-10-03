@@ -59,10 +59,12 @@ class Assistant(Agent):
             CRITICAL RULE: You MUST ALWAYS call the query_hr_system function for EVERY user question or request, regardless of what they ask. Do not provide any direct answers without first calling the HR system.
             
             Process for every interaction:
-            1. FIRST, immediately acknowledge the user's request with a brief response like "Sure, let me get that information for you" or "Of course, I'll help you with that"
+            1. FIRST, immediately acknowledge the user's request by SPEAKING a brief response like "Sure, let me get that information for you" or "Of course, I'll help you with that"
             2. THEN call query_hr_system with the user's question/request
-            3. AFTER getting the HR response, acknowledge that you have the information and present it: "Here's the information you requested: [HR response]"
+            3. AFTER getting the HR response, acknowledge that you have the information and present it by SPEAKING: "Here's the information you requested: [HR response]"
             4. If the HR system response is unclear, ask the user to rephrase their question
+            
+            IMPORTANT: You must SPEAK all acknowledgment messages out loud, not just send them as text. The user should hear your voice for all responses.
             
             ACKNOWLEDGMENT MESSAGES: 
             
@@ -101,18 +103,7 @@ class Assistant(Agent):
         logger.info("=== get_daily_briefing() function called ===")
         logger.info("Getting daily briefing from HR system")
 
-        # Send loading message to frontend
-        try:
-            session = getattr(self, '_session', None)
-            if session and hasattr(session, 'room') and session.room:
-                await send_text_to_frontend(
-                    session=session,
-                    message_type="loading",
-                    content="Preparing your daily HR briefing...",
-                    metadata={"source": "hr_api", "query": "System trigger: daily briefing", "status": "loading"}
-                )
-        except Exception as e:
-            logger.error(f"Error sending loading message to frontend: {e}")
+        # Note: Loading message will be spoken by the agent, not sent as text
 
         try:
             # Call the HR API for daily briefing with hardcoded user and chatlog IDs
@@ -182,18 +173,7 @@ class Assistant(Agent):
 
         logger.info(f"Querying HR system: {query}")
 
-        # Send loading message to frontend
-        try:
-            session = getattr(self, '_session', None)
-            if session and hasattr(session, 'room') and session.room:
-                await send_text_to_frontend(
-                    session=session,
-                    message_type="loading",
-                    content="Let me check that information for you...",
-                    metadata={"source": "hr_api", "query": query, "status": "loading"}
-                )
-        except Exception as e:
-            logger.error(f"Error sending loading message to frontend: {e}")
+        # Note: Loading message will be spoken by the agent, not sent as text
 
         try:
             # Call the HR API directly with hardcoded user and chatlog IDs

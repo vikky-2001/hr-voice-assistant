@@ -113,6 +113,7 @@ docs/_build/
 # Frontend files
 frontend_example.html
 flutter_text_display_example.dart
+frontend.txt
 *.html
 *.dart
 frontend/

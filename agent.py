@@ -306,6 +306,40 @@ async def entrypoint(ctx: JobContext):
         logger.info("Agent started speaking")
         # Note: We don't send generic text here since we'll send the exact text via agent_speech_committed
 
+    # Send live transcripts as the agent speaks (real-time)
+    @session.on("agent_speech_partial")
+    def _on_agent_speech_partial(ev):
+        logger.info(f"Agent speech partial: {ev.text}")
+        try:
+            if hasattr(session, 'room') and session.room:
+                asyncio.create_task(send_text_to_frontend(
+                    session=session,
+                    message_type="live_transcript",
+                    content=ev.text,
+                    metadata={"source": "agent_speech_partial", "timestamp": ev.timestamp, "is_partial": True}
+                ))
+            else:
+                logger.warning("Session room not available for sending live transcript to frontend")
+        except Exception as e:
+            logger.error(f"Error sending live transcript to frontend: {e}")
+
+    # Send user speech partial transcripts (real-time)
+    @session.on("user_speech_partial")
+    def _on_user_speech_partial(ev):
+        logger.info(f"User speech partial: {ev.text}")
+        try:
+            if hasattr(session, 'room') and session.room:
+                asyncio.create_task(send_text_to_frontend(
+                    session=session,
+                    message_type="user_live_transcript",
+                    content=ev.text,
+                    metadata={"source": "user_speech_partial", "timestamp": ev.timestamp, "is_partial": True}
+                ))
+            else:
+                logger.warning("Session room not available for sending user live transcript to frontend")
+        except Exception as e:
+            logger.error(f"Error sending user live transcript to frontend: {e}")
+
     # Start the session, which initializes the voice pipeline and warms up the models
     logger.info("Starting AgentSession...")
     assistant = Assistant()

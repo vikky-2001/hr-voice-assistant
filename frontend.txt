@@ -1,0 +1,709 @@
+import 'dart:async';
+import 'dart:convert';
+import 'package:flutter/foundation.dart';
+import 'package:livekit_client/livekit_client.dart';
+import 'package:logger/logger.dart';
+import 'services/livekit_token_generator.dart';
+
+class LiveKitService extends ChangeNotifier {
+  static final LiveKitService _instance = LiveKitService._internal();
+  factory LiveKitService() => _instance;
+  LiveKitService._internal();
+
+  final Logger _logger = Logger();
+
+  // Room and connection state
+  Room? _room;
+  bool _isConnected = false;
+  bool _isConnecting = false;
+  String _connectionStatus = 'Disconnected';
+  String? _error;
+
+  // Participants
+  LocalParticipant? _localParticipant;
+  List<RemoteParticipant> _remoteParticipants = [];
+  int _participantCount = 0;
+
+  // Audio state
+  bool _isMicrophoneMuted = true;
+  bool _isAudioEnabled = false;
+
+  // Agent message capture
+  List<String> _agentMessages = [];
+  String _latestAgentText = '';
+  String? _dailyBriefing;
+  bool _dailyBriefingReceived = false;
+  final StreamController<String> _agentMessageController = StreamController<String>.broadcast();
+  
+  // Live transcript capture
+  String _currentLiveTranscript = '';
+  String _currentUserTranscript = '';
+  bool _isAgentSpeaking = false;
+  bool _isUserSpeaking = false;
+  final StreamController<Map<String, dynamic>> _liveTranscriptController = StreamController<Map<String, dynamic>>.broadcast();
+
+  // Public getters
+  bool get isConnected => _isConnected;
+  bool get isConnecting => _isConnecting;
+  String get connectionStatus => _connectionStatus;
+  String? get error => _error;
+  bool get isMicrophoneMuted => _isMicrophoneMuted;
+  bool get isAudioEnabled => _isAudioEnabled;
+  List<RemoteParticipant> get remoteParticipants => _remoteParticipants;
+  LocalParticipant? get localParticipant => _localParticipant;
+  int get participantCount => _participantCount;
+  Room? get room => _room;
+  
+  // Agent message getters
+  List<String> get agentMessages => List.unmodifiable(_agentMessages);
+  String get latestAgentText => _latestAgentText;
+  String? get dailyBriefing => _dailyBriefing;
+  bool get dailyBriefingReceived => _dailyBriefingReceived;
+  Stream<String> get agentMessageStream => _agentMessageController.stream;
+  
+  // Live transcript getters
+  String get currentLiveTranscript => _currentLiveTranscript;
+  String get currentUserTranscript => _currentUserTranscript;
+  bool get isAgentSpeaking => _isAgentSpeaking;
+  bool get isUserSpeaking => _isUserSpeaking;
+  Stream<Map<String, dynamic>> get liveTranscriptStream => _liveTranscriptController.stream;
+
+  Future<void> initialize() async {
+    if (_isConnecting || _isConnected) return;
+    
+    _logger.i('🚀 Initializing LiveKit service...');
+    await connect();
+  }
+
+  Future<void> connect() async {
+    if (_isConnecting || _isConnected) return;
+
+    try {
+      _isConnecting = true;
+      _connectionStatus = 'Connecting...';
+      _error = null;
+      notifyListeners();
+
+      _logger.i('🔗 Connecting to LiveKit...');
+
+      _room = Room();
+      _setupRoomListeners();
+
+      // Generate token
+      _logger.i('🎫 Generating token...');
+      final token = LiveKitTokenGenerator.generateToken(
+        roomName: 'Tester-room1',
+        identity: 'Mobile-hr-worker',
+      );
+      final url = LiveKitTokenGenerator.getServerUrl();
+
+      _logger.i('🌐 Connecting to URL: $url');
+      _logger.i('🏠 Room: Tester-room1');
+      _logger.i('👤 Identity: Mobile-hr-worker');
+      
+      await _room!.connect(url, token);
+      _logger.i('✅ Connected to LiveKit room');
+
+      _isConnected = true;
+      _isConnecting = false;
+      _connectionStatus = 'Connected';
+
+      // Enable microphone for full-duplex audio
+      await _enableAudioWithDelay();
+
+      notifyListeners();
+    } catch (error) {
+      _logger.e('❌ Connection failed: $error');
+      _logger.e('📋 Error details: ${error.runtimeType}');
+      _handleConnectionError('Connection failed: ${error.toString()}');
+    }
+  }
+
+  void _setupRoomListeners() {
+    if (_room == null) return;
+
+    // Enhanced room state listener with debug
+    _room!.addListener(() {
+      print('🔍 ============== ROOM STATE CHANGED ==============');
+      print('🔍 Remote Participants: ${_room!.remoteParticipants.length}');
+      for (final participant in _room!.remoteParticipants.values) {
+        print('🔍   - ${participant.identity} (${participant.sid})');
+        print('🔍     Audio Tracks: ${participant.audioTrackPublications.length}');
+        print('🔍     Video Tracks: ${participant.videoTrackPublications.length}');
+        print('🔍     Data Tracks: ${participant.trackPublications.values.where((p) => p.kind == TrackType.DATA).length}');
+      }
+      print('🔍 ===============================================');
+      
+      _updateParticipants();
+      notifyListeners();
+    });
+
+    // Add comprehensive event listeners for agent message capture
+    final listener = _room!.createListener();
+    
+    // CATCH ALL EVENTS - Log everything for debugging
+    print('🔍 =============== SETTING UP ALL EVENT LISTENERS ===============');
+    print('🔍 Listening for ALL events from agents...');
+    print('🔍 =============================================================');
+    
+    listener
+      ..on<RoomConnectedEvent>((event) {
+        print('🔍 =============== ROOM CONNECTED EVENT ===============');
+        print('🔍 Room Name: ${event.room.name}');
+        print('🔍 Room State: ${event.room.connectionState}');
+        print('🔍 ===================================================');
+        _logger.i('🎉 Room connected successfully');
+      })
+      ..on<RoomDisconnectedEvent>((event) {
+        _logger.i('👋 Room disconnected');
+        _handleConnectionError('Room disconnected: ${event.reason}');
+      })
+      ..on<ParticipantConnectedEvent>((event) {
+        final participant = event.participant;
+        
+        // DEBUG LOGGING FOR PARTICIPANT
+        print('🔍 =============== PARTICIPANT CONNECTED DEBUG ===============');
+        print('🔍 Participant Identity: ${participant.identity}');
+        print('🔍 Participant Metadata: ${participant.metadata}');
+        print('🔍 Participant Attributes: ${participant.attributes}');
+        print('🔍 Participant Kind: ${participant.kind}');
+        print('🔍 ========================================================');
+        
+        _logger.i('👤 Participant joined: ${participant.identity}');
+        
+        // Check if this is an AI agent
+        final isAgent = participant.identity.toLowerCase().contains('agent') || 
+                       participant.identity.toLowerCase().contains('assistant') ||
+                       participant.identity.toLowerCase().contains('voice') ||
+                       participant.attributes['lk.agent'] == 'true';
+        
+        print('🔍 Agent Detection Result: $isAgent');
+        
+        if (isAgent) {
+          print('🤖 ✅ AI AGENT DETECTED: ${participant.identity}');
+          _logger.i('🤖 AI Agent detected: ${participant.identity}');
+          // Note: Data messages will be received via DataReceivedEvent automatically
+        } else {
+          print('❌ Not detected as agent: ${participant.identity}');
+        }
+      })
+      ..on<ParticipantDisconnectedEvent>((event) {
+        final participant = event.participant;
+        _logger.i('👋 Participant left: ${participant.identity}');
+      })
+      ..on<TrackPublishedEvent>((event) {
+        final publication = event.publication;
+        final participant = event.participant;
+        
+        // DEBUG LOGGING FOR TRACK PUBLISHED
+        print('🔍 ================ TRACK PUBLISHED DEBUG ================');
+        print('🔍 Track Kind: ${publication.kind}');
+        print('🔍 Track Source: ${publication.source}');
+        print('🔍 Track Name: ${publication.name}');
+        print('🔍 Track Subscribed: ${publication.subscribed}');
+        print('🔍 From Participant: ${participant.identity}');
+        print('🔍 Participant Attributes: ${participant.attributes}');
+        print('🔍 ======================================================');
+        
+        _logger.i('📢 Track published: ${publication.kind} by ${participant.identity}');
+        
+        // Handle both audio and data tracks from agents
+        final isAgent = participant.identity.toLowerCase().contains('agent') || 
+                       participant.identity.toLowerCase().contains('assistant') ||
+                       participant.attributes['lk.agent'] == 'true';
+        
+        print('🔍 Is Agent for Track: $isAgent');
+        
+        if (isAgent) {
+          if (publication.kind == TrackType.DATA) {
+            print('📡 ✅ AGENT DATA TRACK PUBLISHED - Will receive via DataReceivedEvent');
+            _logger.i('📡 Agent data track published - will receive via DataReceivedEvent');
+          } else if (publication.kind == TrackType.AUDIO) {
+            print('🎤 ✅ AGENT AUDIO TRACK PUBLISHED - Subscribing...');
+            _logger.i('🎤 Agent audio track published - subscribing for audio');
+            publication.subscribe();
+          } else {
+            print('❓ Unknown track type from agent: ${publication.kind}');
+          }
+        } else {
+          print('❌ Track from non-agent participant: ${participant.identity}');
+        }
+      })
+      ..on<TrackSubscribedEvent>((event) {
+        final track = event.track;
+        final participant = event.participant;
+        _logger.i('🎵 Track subscribed: ${track.kind} from ${participant.identity}');
+        
+        // Handle agent audio track subscription
+        final isAgent = participant.identity.toLowerCase().contains('agent') || 
+                       participant.identity.toLowerCase().contains('assistant') ||
+                       participant.attributes['lk.agent'] == 'true';
+        
+        if (isAgent && track is RemoteAudioTrack) {
+          _logger.i('🔊 Agent audio track subscribed - agent is speaking');
+          // Set up transcript event listener for real-time speech-to-text
+          _setupTranscriptListener(track, participant);
+          _handleAgentSpeaking(participant.identity);
+        }
+      })
+      ..on<TrackUnpublishedEvent>((event) {
+        print('🔍 ============== TRACK UNPUBLISHED DEBUG ==============');
+        print('🔍 Track Kind: ${event.publication.kind}');
+        print('🔍 From Participant: ${event.participant.identity}');
+        print('🔍 ===================================================');
+      })
+      ..on<TrackUnsubscribedEvent>((event) {
+        print('🔍 ============= TRACK UNSUBSCRIBED DEBUG =============');
+        print('🔍 Track Kind: ${event.track.kind}');
+        print('🔍 From Participant: ${event.participant.identity}');
+        print('🔍 ==================================================');
+      })
+      ..on<TrackMutedEvent>((event) {
+        print('🔍 =============== TRACK MUTED DEBUG ===============');
+        print('🔍 Track Kind: ${event.publication.kind}');
+        print('🔍 From Participant: ${event.participant.identity}');
+        print('🔍 Muted: ${event.publication.muted}');
+        print('🔍 ===============================================');
+      })
+      ..on<ActiveSpeakersChangedEvent>((event) {
+        print('🔍 ============ ACTIVE SPEAKERS CHANGED ============');
+        print('🔍 Active Speakers: ${event.speakers.map((s) => s.identity).join(", ")}');
+        for (final speaker in event.speakers) {
+          print('🔍   - ${speaker.identity}: Level ${speaker.audioLevel}');
+        }
+        print('🔍 ===============================================');
+      })
+      ..on<DataReceivedEvent>((event) {
+        try {
+          final rawData = utf8.decode(event.data);
+          final participant = event.participant;
+          
+          // COMPREHENSIVE DEBUG LOGGING - COMPLETE AGENT RESPONSE
+          print('🎯 ====================== AGENT RESPONSE RECEIVED ======================');
+          print('🎯 TIMESTAMP: ${DateTime.now().toIso8601String()}');
+          print('🎯 FROM PARTICIPANT: ${participant?.identity ?? "Unknown"}');
+          print('🎯 PARTICIPANT KIND: ${participant?.kind ?? "Unknown"}');
+          print('🎯 PARTICIPANT METADATA: ${participant?.metadata ?? "None"}');
+          print('🎯 PARTICIPANT ATTRIBUTES: ${participant?.attributes ?? "None"}');
+          print('🎯 ');
+          print('🎯 RAW DATA DETAILS:');
+          print('🎯   - Data Length: ${event.data.length} bytes');
+          print('🎯   - Event Topic: ${event.topic ?? "No topic"}');
+          print('🎯   - Raw Bytes: ${event.data}');
+          print('🎯 ');
+          print('🎯 DECODED CONTENT (UTF-8):');
+          print('🎯 ┌─────────────────────────────────────────────────────────────┐');
+          print('🎯 │ $rawData');
+          print('🎯 └─────────────────────────────────────────────────────────────┘');
+          print('🎯 ');
+          print('🎯 CONTENT PREVIEW (First 200 chars):');
+          print('🎯 ${rawData.length > 200 ? rawData.substring(0, 200) + "..." : rawData}');
+          print('🎯 =====================================================================');
+          
+          _logger.i('📨 Data received from ${participant?.identity}: $rawData');
+          
+          // Check if this is from an agent
+          final isAgent = participant != null && (
+            participant.identity.toLowerCase().contains('agent') || 
+            participant.identity.toLowerCase().contains('assistant') ||
+            participant.attributes['lk.agent'] == 'true'
+          );
+          
+          print('🔍 Is Agent Check: $isAgent');
+          print('🔍 Agent Identity Contains "agent": ${participant?.identity.toLowerCase().contains('agent') ?? false}');
+          print('🔍 Agent Identity Contains "assistant": ${participant?.identity.toLowerCase().contains('assistant') ?? false}');
+          print('🔍 Agent Attributes: ${participant?.attributes}');
+          
+          if (isAgent && rawData.isNotEmpty) {
+            print('✅ Processing agent data message...');
+            _handleDataMessage(rawData, participant);
+          } else if (!isAgent) {
+            print('❌ Ignoring message - not from agent');
+          } else if (rawData.isEmpty) {
+            print('❌ Ignoring message - empty data');
+          }
+        } catch (e) {
+          print('💥 ERROR processing received data: $e');
+          print('💥 Error details: ${e.runtimeType}');
+          _logger.w('⚠️ Error processing received data: $e');
+        }
+      });
+  }
+
+  void _handleAgentMessage(String message) {
+    final timestamp = DateTime.now().toLocal().toString().substring(11, 19);
+    final timestampedMessage = '[$timestamp] $message';
+    
+    print('🔍 ============== STORING AGENT MESSAGE DEBUG ==============');
+    print('🔍 Message: $message');
+    print('🔍 Timestamped: $timestampedMessage');
+    print('🔍 Before - Total Messages: ${_agentMessages.length}');
+    print('🔍 Before - Latest Text: $_latestAgentText');
+    
+    _agentMessages.add(timestampedMessage);
+    _latestAgentText = message;
+    
+    print('🔍 After - Total Messages: ${_agentMessages.length}');
+    print('🔍 After - Latest Text: $_latestAgentText');
+    print('🔍 Notifying listeners...');
+    print('🔍 =====================================================');
+    
+    _logger.i('🤖 Agent message captured: $message');
+    _logger.i('📝 Total agent messages: ${_agentMessages.length}');
+    
+    // Notify listeners and stream subscribers
+    notifyListeners();
+    _agentMessageController.add(message);
+    
+    print('✅ Agent message processed and listeners notified');
+  }
+
+  void _handleUserSpeech(String speech) {
+    print('🔍 ============== USER SPEECH DEBUG ==============');
+    print('🔍 Speech: $speech');
+    print('🔍 Length: ${speech.length}');
+    print('🔍 ==============================================');
+    
+    _logger.i('👤 User speech captured: $speech');
+    
+    // Send to live transcript stream
+    _liveTranscriptController.add({
+      'speaker': 'user',
+      'transcript': speech,
+      'timestamp': DateTime.now().toIso8601String(),
+      'is_partial': false,
+    });
+    
+    // Notify listeners
+    notifyListeners();
+    
+    print('✅ User speech processed and listeners notified');
+  }
+
+  void _handleLiveTranscript(String transcript, String speaker) {
+    print('🔍 ============== LIVE TRANSCRIPT DEBUG ==============');
+    print('🔍 Speaker: $speaker');
+    print('🔍 Transcript: $transcript');
+    print('🔍 Length: ${transcript.length}');
+    print('🔍 =================================================');
+    
+    if (speaker == 'agent') {
+      _currentLiveTranscript = transcript;
+      _isAgentSpeaking = true;
+      _logger.i('📝 Live agent transcript: $transcript');
+    } else if (speaker == 'user') {
+      _currentUserTranscript = transcript;
+      _isUserSpeaking = true;
+      _logger.i('👤 Live user transcript: $transcript');
+    }
+    
+    // Send to live transcript stream
+    _liveTranscriptController.add({
+      'speaker': speaker,
+      'transcript': transcript,
+      'timestamp': DateTime.now().toIso8601String(),
+      'is_partial': true,
+    });
+    
+    // Notify listeners
+    notifyListeners();
+    
+    print('✅ Live transcript processed and listeners notified');
+  }
+
+  void _handleDataMessage(String rawData, RemoteParticipant? participant) {
+    print('🔍 ================= PROCESSING DATA MESSAGE =================');
+    print('🔍 Raw Data: $rawData');
+    print('🔍 Data Length: ${rawData.length}');
+    print('🔍 From Participant: ${participant?.identity}');
+    
+    try {
+      // Try to parse as JSON first (structured messages)
+      print('🔍 Attempting JSON parse...');
+      final messageData = jsonDecode(rawData) as Map<String, dynamic>;
+      final messageType = messageData['type'] as String?;
+      final content = messageData['content'] as String?;
+      final timestamp = messageData['timestamp'] as String?;
+      
+      print('✅ JSON PARSED SUCCESSFULLY:');
+      print('🔍   Type: $messageType');
+      print('🔍   Content: $content');
+      print('🔍   Timestamp: $timestamp');
+      print('🔍   Full JSON: $messageData');
+      
+      _logger.i('📊 JSON message parsed - type: $messageType, content: ${content?.substring(0, 50)}...');
+      
+      if (messageType == 'daily_briefing' && content != null) {
+        print('📋 DAILY BRIEFING DETECTED - Processing...');
+        _dailyBriefing = content;
+        _dailyBriefingReceived = true;
+        _handleAgentMessage(content);
+        print('📋 Daily Briefing stored successfully');
+        _logger.i('📋 Daily Briefing Received and stored');
+      } else if (messageType == 'agent_response' && content != null) {
+        print('🤖 AGENT RESPONSE DETECTED - Processing...');
+        _handleAgentMessage(content);
+        print('🤖 Agent Response stored successfully');
+        _logger.i('🤖 Agent Response captured');
+      } else if (messageType == 'message' && content != null) {
+        print('💬 AGENT MESSAGE DETECTED - Processing...');
+        _handleAgentMessage(content);
+        print('💬 Agent Message stored successfully');
+        _logger.i('💬 Agent Message captured');
+      } else if (messageType == 'loading' && content != null) {
+        print('⏳ LOADING MESSAGE DETECTED - Processing...');
+        _handleAgentMessage(content);
+        print('⏳ Loading message stored successfully');
+        _logger.i('⏳ Loading message captured');
+      } else if (messageType == 'user_speech' && content != null) {
+        print('👤 USER SPEECH DETECTED - Processing...');
+        _handleUserSpeech(content);
+        print('👤 User speech stored successfully');
+        _logger.i('👤 User speech captured');
+      } else if (messageType == 'live_transcript' && content != null) {
+        print('📝 LIVE TRANSCRIPT DETECTED - Processing...');
+        _handleLiveTranscript(content, 'agent');
+        print('📝 Live Transcript stored successfully');
+        _logger.i('📝 Live Transcript captured');
+      } else if (messageType == 'user_live_transcript' && content != null) {
+        print('👤 USER LIVE TRANSCRIPT DETECTED - Processing...');
+        _handleLiveTranscript(content, 'user');
+        print('👤 User Live Transcript stored successfully');
+        _logger.i('👤 User Live Transcript captured');
+      } else {
+        print('❓ UNKNOWN MESSAGE TYPE: $messageType');
+        print('❓ Content: $content');
+      }
+    } catch (e) {
+      // If JSON parsing fails, treat as plain text (fallback)
+      print('⚠️ JSON PARSE FAILED - Treating as plain text');
+      print('⚠️ Error: $e');
+      print('📝 Raw text content: $rawData');
+      _logger.i('📝 Raw text message (non-JSON): $rawData');
+      _handleAgentMessage(rawData);
+    }
+    
+    print('🔍 Current Agent State After Processing:');
+    print('🔍   Total Messages: ${_agentMessages.length}');
+    print('🔍   Latest Text: $_latestAgentText');
+    print('🔍   Daily Briefing: $_dailyBriefing');
+    print('🔍   Daily Briefing Received: $_dailyBriefingReceived');
+    print('🔍 ========================================================');
+  }
+
+  void _setupTranscriptListener(RemoteAudioTrack track, RemoteParticipant participant) {
+    // Set up transcript event listener for real-time speech-to-text
+    track.addListener(() {
+      // Listen for transcript events on the audio track
+      _logger.i('🎤 Audio track listener added for transcript events');
+    });
+    
+    // Note: In LiveKit Flutter SDK, transcript events might be handled differently
+    // This is the pattern from your backend code - may need adjustment for Flutter SDK
+    _logger.i('📝 Transcript listener set up for ${participant.identity}');
+  }
+
+  void _handleTranscript(String transcriptText, RemoteParticipant participant) {
+    _logger.i('📝 Transcript received: $transcriptText');
+    
+    // Add transcript as agent message
+    _handleAgentMessage(transcriptText);
+    
+    // Check if this is a daily briefing
+    if (transcriptText.toLowerCase().contains('daily_briefing') && !_dailyBriefingReceived) {
+      _dailyBriefing = transcriptText;
+      _dailyBriefingReceived = true;
+      _logger.i('📋 Daily Briefing detected in transcript');
+    }
+  }
+
+  void _handleAgentSpeaking(String agentIdentity) {
+    print('🎤 ================= AGENT SPEAKING DETECTED =================');
+    print('🎤 Agent Identity: $agentIdentity');
+    print('🎤 Audio Track Subscribed - Agent is now speaking');
+    print('🎤 Waiting for text data via DataReceivedEvent...');
+    print('🎤 ');
+    print('🎤 IMPORTANT: If you hear the agent but see no "AGENT RESPONSE RECEIVED"');
+    print('🎤 messages below, it means the backend is NOT sending text data.');
+    print('🎤 ');
+    print('🎤 The agent should send JSON like:');
+    print('🎤 {"type":"daily_briefing","content":"Your text here","timestamp":"..."}');
+    print('🎤 ============================================================');
+    
+    _logger.i('🎙️ Agent is speaking - waiting for real transcribed data via DataReceivedEvent');
+    _logger.i('🔍 If no text appears, the agent may not be configured to send transcription data');
+  }
+
+  // Method to clear agent messages (useful for fresh sessions)
+  void clearAgentMessages() {
+    _agentMessages.clear();
+    _latestAgentText = '';
+    _dailyBriefing = null;
+    _dailyBriefingReceived = false;
+    _logger.i('🧹 Agent messages cleared');
+    notifyListeners();
+  }
+
+  // Method to clear live transcripts
+  void clearLiveTranscripts() {
+    _currentLiveTranscript = '';
+    _currentUserTranscript = '';
+    _isAgentSpeaking = false;
+    _isUserSpeaking = false;
+    _logger.i('🧹 Live transcripts cleared');
+    notifyListeners();
+  }
+
+  // Method to stop agent speaking (when speech ends)
+  void stopAgentSpeaking() {
+    _isAgentSpeaking = false;
+    _currentLiveTranscript = '';
+    _logger.i('🔇 Agent stopped speaking');
+    notifyListeners();
+  }
+
+  // Method to stop user speaking (when speech ends)
+  void stopUserSpeaking() {
+    _isUserSpeaking = false;
+    _currentUserTranscript = '';
+    _logger.i('🔇 User stopped speaking');
+    notifyListeners();
+  }
+
+  // Method for external components to add agent messages (if needed)
+  void addAgentMessage(String message) {
+    _logger.i('📝 External agent message added: $message');
+    _handleAgentMessage(message);
+  }
+
+  // No test methods - only real agent data capture
+
+  Future<void> _enableAudioWithDelay() async {
+    // Wait for connection to stabilize
+    await Future.delayed(const Duration(seconds: 2));
+    
+    try {
+      if (_room?.localParticipant != null) {
+        await _room!.localParticipant!.setMicrophoneEnabled(true);
+        _isMicrophoneMuted = false;
+        _isAudioEnabled = true;
+        _connectionStatus = 'Connected (Audio Ready)';
+        _logger.i('🎤 Microphone enabled for full-duplex audio');
+        notifyListeners();
+      }
+    } catch (e) {
+      _logger.w('⚠️ Failed to enable microphone: $e');
+    }
+  }
+
+  void _updateParticipants() {
+    if (_room == null) return;
+
+    _localParticipant = _room!.localParticipant;
+    _remoteParticipants = _room!.remoteParticipants.values.toList();
+    _participantCount = _remoteParticipants.length + 1; // +1 for local participant
+  }
+
+  Future<void> toggleMicrophone() async {
+    if (!_isAudioEnabled || _room?.localParticipant == null) return;
+
+    try {
+      _isMicrophoneMuted = !_isMicrophoneMuted;
+      await _room!.localParticipant!.setMicrophoneEnabled(!_isMicrophoneMuted);
+      notifyListeners();
+    } catch (e) {
+      _logger.w('⚠️ Failed to toggle microphone: $e');
+    }
+  }
+
+  void _handleConnectionError(String error) {
+    _isConnected = false;
+    _isConnecting = false;
+    _connectionStatus = 'Failed';
+    _error = error;
+    _cleanup();
+    notifyListeners();
+  }
+
+  Future<void> disconnect() async {
+    _logger.i('🔌 Disconnecting from LiveKit...');
+    
+    try {
+      // First, disable audio to stop transmission
+      if (_room?.localParticipant != null) {
+        _logger.i('🎤 Disabling microphone...');
+        await _room!.localParticipant!.setMicrophoneEnabled(false);
+      }
+      
+      // Update state immediately
+      _isConnected = false;
+      _isConnecting = false;
+      _connectionStatus = 'Disconnecting...';
+      notifyListeners();
+      
+      // Properly disconnect from the room
+      if (_room != null) {
+        _logger.i('🚪 Leaving room...');
+        await _room!.disconnect();
+        await _room!.dispose();
+        _logger.i('✅ Room disconnected and disposed');
+      }
+      
+      // Clean up all state
+      _cleanup();
+      _connectionStatus = 'Disconnected';
+      
+      _logger.i('✅ Successfully disconnected from LiveKit');
+      notifyListeners();
+      
+    } catch (e) {
+      _logger.w('⚠️ Error during disconnect: $e');
+      // Force cleanup even if there was an error
+      _cleanup();
+      _connectionStatus = 'Disconnected';
+      notifyListeners();
+    }
+  }
+
+  void _cleanup() {
+    _logger.i('🧹 Cleaning up LiveKit service...');
+    _room = null;
+    _localParticipant = null;
+    _remoteParticipants.clear();
+    _participantCount = 0;
+    _isMicrophoneMuted = true;
+    _isAudioEnabled = false;
+    _error = null;
+    
+    // Clear agent messages on cleanup
+    _agentMessages.clear();
+    _latestAgentText = '';
+    _dailyBriefing = null;
+    _dailyBriefingReceived = false;
+    
+    // Clear live transcripts on cleanup
+    _currentLiveTranscript = '';
+    _currentUserTranscript = '';
+    _isAgentSpeaking = false;
+    _isUserSpeaking = false;
+    
+    _logger.i('✅ Cleanup completed');
+  }
+
+  bool isParticipantSpeaking(RemoteParticipant participant) {
+    // Simple implementation - you can enhance this with actual audio level detection
+    return false;
+  }
+
+  String getParticipantDisplayName(RemoteParticipant participant) {
+    return participant.identity.isNotEmpty ? participant.identity : 'Unknown';
+  }
+
+  @override
+  void dispose() {
+    disconnect();
+    _agentMessageController.close();
+    _liveTranscriptController.close();
+    super.dispose();
+  }
+} 

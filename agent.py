@@ -1058,10 +1058,6 @@ async def entrypoint(ctx: JobContext):
     await session.start(
         agent=assistant,
         room=ctx.room,
-        # Optimized settings for faster startup
-        auto_manage_audio=True,  # Enable automatic audio management
-        # Skip unnecessary initialization steps
-        skip_audio_setup=False,  # Keep audio setup but optimize it
     )
     
     elapsed = time.time() - start_time

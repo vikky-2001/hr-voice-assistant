@@ -75,6 +75,38 @@ class LiveKitService extends ChangeNotifier {
     await connect();
   }
 
+  // User configuration for dynamic user ID
+  String? _currentUserId;
+  int? _currentChatlogId;
+  int? _currentAgentId;
+  String? _currentUserEmail;
+  String? _currentUserName;
+
+  // Getters for user configuration
+  String? get currentUserId => _currentUserId;
+  int? get currentChatlogId => _currentChatlogId;
+  int? get currentAgentId => _currentAgentId;
+  String? get currentUserEmail => _currentUserEmail;
+  String? get currentUserName => _currentUserName;
+
+  // Method to set user configuration
+  void setUserConfiguration({
+    String? userId,
+    int? chatlogId,
+    int? agentId,
+    String? userEmail,
+    String? userName,
+  }) {
+    _currentUserId = userId;
+    _currentChatlogId = chatlogId;
+    _currentAgentId = agentId;
+    _currentUserEmail = userEmail;
+    _currentUserName = userName;
+    
+    _logger.i('👤 User configuration set: userId=$userId, chatlogId=$chatlogId, agentId=$agentId');
+    notifyListeners();
+  }
+
   Future<void> connect() async {
     if (_isConnecting || _isConnected) return;
 
@@ -89,11 +121,18 @@ class LiveKitService extends ChangeNotifier {
       _room = Room();
       _setupRoomListeners();
 
-      // Generate token
-      _logger.i('🎫 Generating token...');
-      final token = LiveKitTokenGenerator.generateToken(
+      // Generate token with user metadata
+      _logger.i('🎫 Generating token with user metadata...');
+      final token = LiveKitTokenGenerator.generateTokenWithMetadata(
         roomName: 'Tester-room1',
         identity: 'Mobile-hr-worker',
+        metadata: {
+          'user_id': _currentUserId ?? 'default-user',
+          'chatlog_id': _currentChatlogId?.toString() ?? '7747',
+          'agent_id': _currentAgentId?.toString() ?? '6',
+          'user_email': _currentUserEmail ?? '',
+          'user_name': _currentUserName ?? 'Mobile User',
+        },
       );
       final url = LiveKitTokenGenerator.getServerUrl();
 
@@ -107,6 +146,9 @@ class LiveKitService extends ChangeNotifier {
       _isConnected = true;
       _isConnecting = false;
       _connectionStatus = 'Connected';
+
+      // Send user configuration to agent after successful connection
+      await sendUserConfigurationToAgent();
 
       // Enable microphone for full-duplex audio
       await _enableAudioWithDelay();
@@ -411,6 +453,148 @@ class LiveKitService extends ChangeNotifier {
     print('✅ Live transcript processed and listeners notified');
   }
 
+  void _handleIntermediateMessage(String message) {
+    print('🔍 ============== INTERMEDIATE MESSAGE DEBUG ==============');
+    print('🔍 Message: $message');
+    print('🔍 Length: ${message.length}');
+    print('🔍 ======================================================');
+    
+    _logger.i('⏳ Intermediate message: $message');
+    
+    // Add to agent messages with special formatting
+    final timestamp = DateTime.now().toLocal().toString().substring(11, 19);
+    final timestampedMessage = '[$timestamp] [Processing] $message';
+    
+    _agentMessages.add(timestampedMessage);
+    _latestAgentText = message;
+    
+    // Send to live transcript stream as agent message
+    _liveTranscriptController.add({
+      'speaker': 'agent',
+      'transcript': message,
+      'timestamp': DateTime.now().toIso8601String(),
+      'is_partial': false,
+      'is_intermediate': true,
+    });
+    
+    // Notify listeners
+    notifyListeners();
+    
+    print('✅ Intermediate message processed and listeners notified');
+  }
+
+  // Method to send user configuration to agent
+  Future<void> sendUserConfigurationToAgent() async {
+    if (_room == null || _localParticipant == null) {
+      _logger.w('⚠️ Cannot send user configuration: not connected to room');
+      return;
+    }
+
+    try {
+      final userConfig = {
+        'type': 'user_configuration',
+        'user_id': _currentUserId ?? 'default-user',
+        'chatlog_id': _currentChatlogId ?? 7747,
+        'agent_id': _currentAgentId ?? 6,
+        'user_email': _currentUserEmail ?? '',
+        'user_name': _currentUserName ?? 'Mobile User',
+        'timestamp': DateTime.now().toIso8601String(),
+      };
+
+      await _localParticipant!.publishData(
+        data: utf8.encode(jsonEncode(userConfig)),
+        topic: 'user_config',
+      );
+
+      _logger.i('📤 User configuration sent to agent: ${userConfig['user_id']}');
+    } catch (e) {
+      _logger.e('❌ Error sending user configuration: $e');
+    }
+  }
+
+  // Method to update user configuration and notify agent
+  Future<void> updateUserConfiguration({
+    String? userId,
+    int? chatlogId,
+    int? agentId,
+    String? userEmail,
+    String? userName,
+  }) async {
+    // Update local configuration
+    setUserConfiguration(
+      userId: userId,
+      chatlogId: chatlogId,
+      agentId: agentId,
+      userEmail: userEmail,
+      userName: userName,
+    );
+
+    // Send to agent if connected
+    if (_isConnected) {
+      await sendUserConfigurationToAgent();
+    }
+  }
+
+  void _handleUserConfigConfirmation(String message) {
+    print('🔍 ============== USER CONFIG CONFIRMATION DEBUG ==============');
+    print('🔍 Message: $message');
+    print('🔍 Length: ${message.length}');
+    print('🔍 ===========================================================');
+    
+    _logger.i('✅ User config confirmation: $message');
+    
+    // Add to agent messages with special formatting
+    final timestamp = DateTime.now().toLocal().toString().substring(11, 19);
+    final timestampedMessage = '[$timestamp] [Config] $message';
+    
+    _agentMessages.add(timestampedMessage);
+    _latestAgentText = message;
+    
+    // Send to live transcript stream as agent message
+    _liveTranscriptController.add({
+      'speaker': 'agent',
+      'transcript': message,
+      'timestamp': DateTime.now().toIso8601String(),
+      'is_partial': false,
+      'is_config_confirmation': true,
+    });
+    
+    // Notify listeners
+    notifyListeners();
+    
+    print('✅ User config confirmation processed and listeners notified');
+  }
+
+  void _handleAutomaticGreeting(String message) {
+    print('🔍 ============== AUTOMATIC GREETING DEBUG ==============');
+    print('🔍 Message: $message');
+    print('🔍 Length: ${message.length}');
+    print('🔍 =====================================================');
+    
+    _logger.i('🤖 Automatic greeting: $message');
+    
+    // Add to agent messages with special formatting
+    final timestamp = DateTime.now().toLocal().toString().substring(11, 19);
+    final timestampedMessage = '[$timestamp] [Welcome] $message';
+    
+    _agentMessages.add(timestampedMessage);
+    _latestAgentText = message;
+    
+    // Send to live transcript stream as agent message
+    _liveTranscriptController.add({
+      'speaker': 'agent',
+      'transcript': message,
+      'timestamp': DateTime.now().toIso8601String(),
+      'is_partial': false,
+      'is_automatic_greeting': true,
+    });
+    
+    // Notify listeners
+    notifyListeners();
+    
+    print('🤖 Automatic greeting processed and listeners notified');
+  }
+
   void _handleDataMessage(String rawData, RemoteParticipant? participant) {
     print('🔍 ================= PROCESSING DATA MESSAGE =================');
     print('🔍 Raw Data: $rawData');
@@ -470,6 +654,21 @@ class LiveKitService extends ChangeNotifier {
         _handleLiveTranscript(content, 'user');
         print('👤 User Live Transcript stored successfully');
         _logger.i('👤 User Live Transcript captured');
+      } else if (messageType == 'intermediate_message' && content != null) {
+        print('⏳ INTERMEDIATE MESSAGE DETECTED - Processing...');
+        _handleIntermediateMessage(content);
+        print('⏳ Intermediate message stored successfully');
+        _logger.i('⏳ Intermediate message captured');
+      } else if (messageType == 'user_config_confirmation' && content != null) {
+        print('✅ USER CONFIG CONFIRMATION DETECTED - Processing...');
+        _handleUserConfigConfirmation(content);
+        print('✅ User config confirmation stored successfully');
+        _logger.i('✅ User config confirmation captured');
+      } else if (messageType == 'automatic_greeting' && content != null) {
+        print('🤖 AUTOMATIC GREETING DETECTED - Processing...');
+        _handleAutomaticGreeting(content);
+        print('🤖 Automatic greeting stored successfully');
+        _logger.i('🤖 Automatic greeting captured');
       } else {
         print('❓ UNKNOWN MESSAGE TYPE: $messageType');
         print('❓ Content: $content');

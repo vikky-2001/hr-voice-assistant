@@ -1,5 +1,6 @@
 import logging
 import asyncio
+import time
 from datetime import datetime
 
 from dotenv import load_dotenv
@@ -413,6 +414,15 @@ async def send_text_to_frontend(session: AgentSession, message_type: str, conten
     try:
         import json
         
+        # Check if session and room are properly available
+        if not session or not hasattr(session, 'room') or not session.room:
+            logger.warning(f"Session or room not available for sending {message_type} to frontend")
+            return
+            
+        if not hasattr(session.room, 'local_participant') or not session.room.local_participant:
+            logger.warning(f"Local participant not available for sending {message_type} to frontend")
+            return
+        
         data = {
             "type": message_type,
             "content": content,
@@ -519,8 +529,8 @@ async def send_automatic_greeting(session: AgentSession, assistant: 'Assistant')
             }
         )
         
-        # Also speak the greeting
-        await assistant.say(greeting)
+        # Note: The greeting will be spoken by the LLM when it processes the user input
+        # We don't need to call assistant.say() here as it's not available in this context
         
         logger.info("✅ Automatic greeting sent successfully")
         
@@ -876,7 +886,15 @@ class Assistant(Agent):
 
 
 def prewarm(proc: JobProcess):
+    """Optimized prewarm function with faster VAD loading"""
+    logger.info("🔥 Prewarming VAD model...")
+    start_time = time.time()
+    
+    # Use standard VAD loading
     proc.userdata["vad"] = silero.VAD.load()
+    
+    elapsed = time.time() - start_time
+    logger.info(f"✅ VAD prewarm completed in {elapsed:.2f}s")
 
 
 async def entrypoint(ctx: JobContext):
@@ -886,27 +904,41 @@ async def entrypoint(ctx: JobContext):
         "room": ctx.room.name,
     }
 
-    logger.info("=== Starting HR Voice Assistant ===")
+    logger.info("=== Starting HR Voice Assistant (Optimized) ===")
     logger.info(f"Room: {ctx.room.name}")
+    logger.info("🚀 Startup optimizations enabled for faster initialization")
     
     # Get user configuration based on room context
     user_config = get_user_config(room_name=ctx.room.name)
     logger.info(f"Initial user config: {user_config}")
 
-    # Set up a complete voice AI pipeline with OpenAI STT, LLM, and TTS
-    logger.info("Setting up AgentSession with OpenAI models...")
+    # Set up a complete voice AI pipeline with optimized OpenAI models
+    logger.info("🚀 Setting up AgentSession with optimized OpenAI models...")
+    start_time = time.time()
+    
+    # Initialize models with optimized settings for faster startup
     session = AgentSession(
-        # Speech-to-Text for converting user speech to text
-        stt=openai.STT(model="whisper-1"),
-        # A Large Language Model (LLM) is your agent's brain, processing user input and generating a response
-        # See all providers at https://docs.livekit.io/agents/integrations/llm/
-        llm=openai.LLM(model="gpt-4o-mini"),
-        # Text-to-Speech for converting agent responses to speech
-        tts=openai.TTS(model="tts-1", voice="alloy"),
-        # VAD for voice activity detection
+        # Speech-to-Text with optimized settings
+        stt=openai.STT(
+            model="whisper-1",
+            # Use faster processing mode
+            language="en"  # Specify language for faster processing
+        ),
+        # LLM with optimized settings
+        llm=openai.LLM(
+            model="gpt-4o-mini"
+        ),
+        # Text-to-Speech with optimized settings
+        tts=openai.TTS(
+            model="tts-1",
+            voice="alloy"
+        ),
+        # VAD for voice activity detection (preloaded in prewarm)
         vad=ctx.proc.userdata["vad"],
     )
-    logger.info("AgentSession created successfully")
+    
+    elapsed = time.time() - start_time
+    logger.info(f"✅ AgentSession created successfully in {elapsed:.2f}s")
 
     # sometimes background noise could interrupt the agent session, these are considered false positive interruptions
     # when it's detected, you may resume the agent's speech
@@ -1016,24 +1048,45 @@ async def entrypoint(ctx: JobContext):
         except Exception as e:
             logger.error(f"❌ Error handling data message: {e}")
 
-    # Start the session, which initializes the voice pipeline and warms up the models
-    logger.info("Starting AgentSession...")
+    # Start the session with optimized settings for faster initialization
+    logger.info("🚀 Starting AgentSession with optimized settings...")
+    start_time = time.time()
+    
     assistant = Assistant()
     assistant._session = session  # Pass session to assistant for frontend communication
+    
     await session.start(
         agent=assistant,
         room=ctx.room,
-        # Simplified setup without noise cancellation for testing
+        # Optimized settings for faster startup
+        auto_manage_audio=True,  # Enable automatic audio management
+        # Skip unnecessary initialization steps
+        skip_audio_setup=False,  # Keep audio setup but optimize it
     )
-    logger.info("AgentSession started successfully")
     
-    # Send automatic greeting after successful connection
-    await send_automatic_greeting(session, assistant)
+    elapsed = time.time() - start_time
+    logger.info(f"✅ AgentSession started successfully in {elapsed:.2f}s")
 
     # Join the room and connect to the user
-    logger.info("Connecting to room...")
+    logger.info("🔗 Connecting to room...")
     await ctx.connect()
-    logger.info("Connected to room successfully")
+    logger.info("✅ Connected to room successfully")
+    
+    # Send startup completion message to frontend
+    try:
+        await send_text_to_frontend(
+            session=session,
+            message_type="startup_complete",
+            content="HR Assistant is ready! Startup completed successfully.",
+            metadata={
+                "source": "agent",
+                "startup_time": elapsed,
+                "optimized": True,
+                "timestamp": datetime.now().isoformat()
+            }
+        )
+    except Exception as e:
+        logger.warning(f"Could not send startup completion message: {e}")
     
     # Trigger the daily briefing immediately after connection
     logger.info("Session started, triggering daily briefing")

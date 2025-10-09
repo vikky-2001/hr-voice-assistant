@@ -534,8 +534,13 @@ async def send_automatic_greeting(session: AgentSession, assistant: 'Assistant')
             }
         )
         
-        # Note: The greeting will be spoken by the LLM when it processes the user input
-        # We don't need to call assistant.say() here as it's not available in this context
+        # Actually speak the greeting using the session's say method
+        try:
+            await session.say(greeting)
+            logger.info("✅ Automatic greeting spoken successfully")
+        except Exception as e:
+            logger.warning(f"Could not speak automatic greeting: {e}")
+            logger.info("✅ Automatic greeting sent to frontend (not spoken)")
         
         logger.info("✅ Automatic greeting sent successfully")
         
@@ -1092,16 +1097,14 @@ async def entrypoint(ctx: JobContext):
     # Send automatic greeting after successful connection
     await send_automatic_greeting(session, assistant)
     
-    # Trigger the daily briefing by calling the assistant method (with timeout)
-    logger.info("Session started, triggering daily briefing")
+    # Trigger the daily briefing in background (non-blocking)
+    logger.info("Session started, triggering daily briefing in background")
     try:
-        # Call the daily briefing method on the assistant with timeout
-        await asyncio.wait_for(assistant.get_daily_briefing(), timeout=15.0)
-        logger.info("Daily briefing completed successfully")
-    except asyncio.TimeoutError:
-        logger.warning("Daily briefing timed out after 15 seconds - continuing without it")
+        # Run daily briefing in background without blocking
+        asyncio.create_task(assistant.get_daily_briefing())
+        logger.info("Daily briefing started in background")
     except Exception as e:
-        logger.error(f"Error in daily briefing: {e}")
+        logger.error(f"Error starting daily briefing: {e}")
         logger.error(f"Error type: {type(e)}")
         import traceback
         logger.error(f"Traceback: {traceback.format_exc()}")
@@ -1114,9 +1117,14 @@ async def entrypoint(ctx: JobContext):
         # Wait for room to be disconnected or other events
         while True:
             await asyncio.sleep(1)
-            if not session.room or not session.room.is_connected:
-                logger.info("Room disconnected, agent session ending")
-                break
+            # Check if session has room attribute and if it's connected
+            if hasattr(session, 'room') and session.room and hasattr(session.room, 'is_connected'):
+                if not session.room.is_connected:
+                    logger.info("Room disconnected, agent session ending")
+                    break
+            else:
+                # If no room attribute, just keep running
+                logger.debug("Session room not available, continuing...")
     except Exception as e:
         logger.error(f"Session ended with error: {e}")
         import traceback

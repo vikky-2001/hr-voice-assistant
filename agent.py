@@ -1084,17 +1084,17 @@ async def entrypoint(ctx: JobContext):
     except Exception as e:
         logger.warning(f"Could not send startup completion message: {e}")
     
-    # Trigger the daily briefing immediately after connection
-    logger.info("Session started, triggering daily briefing")
-    logger.info("About to call generate_reply with system trigger")
+    # Send automatic greeting after successful connection
+    await send_automatic_greeting(session, assistant)
     
+    # Trigger the daily briefing by calling the assistant method
+    logger.info("Session started, triggering daily briefing")
     try:
-        await session.generate_reply(
-            instructions="System trigger: daily briefing"
-        )
-        logger.info("generate_reply completed successfully")
+        # Call the daily briefing method on the assistant
+        await assistant.get_daily_briefing()
+        logger.info("Daily briefing completed successfully")
     except Exception as e:
-        logger.error(f"Error in generate_reply: {e}")
+        logger.error(f"Error in daily briefing: {e}")
         logger.error(f"Error type: {type(e)}")
         import traceback
         logger.error(f"Traceback: {traceback.format_exc()}")

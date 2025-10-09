@@ -2,17 +2,4 @@
   subdomain = "missionmind-gl3d4ero"
 
 [agent]
-  id = "CA_BMdFS4tSGBWd"
-  # Keep agent running all the time
-  min_replicas = 1
-  max_replicas = 1
-  # Prevent agent from sleeping due to inactivity
-  idle_timeout = 0
-  # Keep agent warm and ready
-  keep_alive = true
-  # Auto-assign agent to rooms when users join
-  auto_assign = true
-  # Agent will join any room that has participants
-  room_pattern = "*"
-  # Agent name for identification
-  name = "HR Voice Assistant"
+  id = "CA_9ptBUymQxjAx"

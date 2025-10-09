@@ -416,11 +416,16 @@ async def send_text_to_frontend(session: AgentSession, message_type: str, conten
         
         # Check if session and room are properly available
         if not session or not hasattr(session, 'room') or not session.room:
-            logger.warning(f"Session or room not available for sending {message_type} to frontend")
+            logger.debug(f"Session or room not available for sending {message_type} to frontend")
             return
             
         if not hasattr(session.room, 'local_participant') or not session.room.local_participant:
-            logger.warning(f"Local participant not available for sending {message_type} to frontend")
+            logger.debug(f"Local participant not available for sending {message_type} to frontend")
+            return
+            
+        # Check if there are any participants in the room (users connected)
+        if not session.room.remote_participants:
+            logger.debug(f"No remote participants connected for sending {message_type} to frontend")
             return
         
         data = {
@@ -674,7 +679,7 @@ class Assistant(Agent):
             logger.info(f"HR API params: {params}")
             
             logger.info("Making HTTP request to HR API...")
-            async with httpx.AsyncClient(timeout=30.0) as client:
+            async with httpx.AsyncClient(timeout=10.0) as client:
                 response = await client.get(url, params=params)
                 logger.info(f"HR API response status: {response.status_code}")
                 response.raise_for_status()
@@ -775,7 +780,7 @@ class Assistant(Agent):
                 "mobile_request": True
             }
             
-            async with httpx.AsyncClient(timeout=30.0) as client:
+            async with httpx.AsyncClient(timeout=10.0) as client:
                 response = await client.get(url, params=params)
                 response.raise_for_status()
                 
@@ -1087,12 +1092,14 @@ async def entrypoint(ctx: JobContext):
     # Send automatic greeting after successful connection
     await send_automatic_greeting(session, assistant)
     
-    # Trigger the daily briefing by calling the assistant method
+    # Trigger the daily briefing by calling the assistant method (with timeout)
     logger.info("Session started, triggering daily briefing")
     try:
-        # Call the daily briefing method on the assistant
-        await assistant.get_daily_briefing()
+        # Call the daily briefing method on the assistant with timeout
+        await asyncio.wait_for(assistant.get_daily_briefing(), timeout=15.0)
         logger.info("Daily briefing completed successfully")
+    except asyncio.TimeoutError:
+        logger.warning("Daily briefing timed out after 15 seconds - continuing without it")
     except Exception as e:
         logger.error(f"Error in daily briefing: {e}")
         logger.error(f"Error type: {type(e)}")
@@ -1102,9 +1109,14 @@ async def entrypoint(ctx: JobContext):
     # Keep agent alive and responsive
     logger.info("🔄 Agent configured to stay active - no idle timeout")
     
-    # Wait for the session to complete (this keeps the agent running)
+    # Keep the agent running by waiting for room events
     try:
-        await session.wait()
+        # Wait for room to be disconnected or other events
+        while True:
+            await asyncio.sleep(1)
+            if not session.room or not session.room.is_connected:
+                logger.info("Room disconnected, agent session ending")
+                break
     except Exception as e:
         logger.error(f"Session ended with error: {e}")
         import traceback

@@ -10,3 +10,9 @@
   idle_timeout = 0
   # Keep agent warm and ready
   keep_alive = true
+  # Auto-assign agent to rooms when users join
+  auto_assign = true
+  # Agent will join any room that has participants
+  room_pattern = "*"
+  # Agent name for identification
+  name = "HR Voice Assistant"

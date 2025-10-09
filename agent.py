@@ -1098,6 +1098,17 @@ async def entrypoint(ctx: JobContext):
         logger.error(f"Error type: {type(e)}")
         import traceback
         logger.error(f"Traceback: {traceback.format_exc()}")
+    
+    # Keep agent alive and responsive
+    logger.info("🔄 Agent configured to stay active - no idle timeout")
+    
+    # Wait for the session to complete (this keeps the agent running)
+    try:
+        await session.wait()
+    except Exception as e:
+        logger.error(f"Session ended with error: {e}")
+        import traceback
+        logger.error(f"Traceback: {traceback.format_exc()}")
 
 
 # Health check app for deployment

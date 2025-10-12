@@ -105,6 +105,19 @@ If you encounter any issues:
 3. Ensure your HR API is accessible
 4. Check your OpenAI API key and quota
 
+## 📚 Documentation
+
+### **For New Team Members**
+- **[Setup Guide](./SETUP_GUIDE.md)** - Complete setup instructions for new developers
+- **[Architecture & Workflow](./ARCHITECTURE_WORKFLOW.md)** - System architecture and development workflow
+- **[Troubleshooting Guide](./TROUBLESHOOTING_GUIDE.md)** - Common issues and solutions
+- **[Visual Workflow Diagrams](./WORKFLOW_DIAGRAMS.md)** - ASCII diagrams showing system flow
+
+### **Feature Documentation**
+- **[Dynamic User ID System](./DYNAMIC_USER_ID_GUIDE.md)** - How user data is passed from frontend to agent
+- **[Automatic Greeting System](./AUTOMATIC_GREETING_GUIDE.md)** - How the agent greets users automatically
+- **[Intermediate Messaging](./INTERMEDIATE_MESSAGING_GUIDE.md)** - Real-time status updates during processing
+
 ## 🔄 Integration
 
 This agent can be integrated with:
@@ -114,3 +127,32 @@ This agent can be integrated with:
 - **Mobile applications** - Using LiveKit mobile SDKs
 
 The agent handles all the voice processing and HR API integration automatically!
+
+## 🚀 Quick Commands
+
+### **For New Developers**
+```bash
+# Setup (first time only)
+git clone https://github.com/vikky-2001/hr-voice-assistant.git
+cd hr-voice-assistant
+lk cloud auth
+lk agent deploy
+
+# Daily development
+git add . && git commit -m "Your changes" && git push
+lk agent deploy
+```
+
+### **For Troubleshooting**
+```bash
+# Check status
+lk agent status CA_9ptBUymQxjAx
+lk room list
+
+# View logs
+lk agent logs CA_9ptBUymQxjAx
+
+# Test agent
+lk room create --name "test-room"
+lk dispatch create --room test-room --agent-name CA_9ptBUymQxjAx
+```

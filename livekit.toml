@@ -3,3 +3,10 @@
 
 [agent]
   id = "CA_9ptBUymQxjAx"
+  # Keep agent running all the time
+  min_replicas = 1
+  max_replicas = 1
+  # Prevent agent from sleeping due to inactivity
+  idle_timeout = 0
+  # Keep agent warm and ready
+  keep_alive = true

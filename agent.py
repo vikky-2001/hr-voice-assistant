@@ -643,6 +643,7 @@ class Assistant(Agent):
         """Get the daily briefing information for the user. This includes important updates, announcements, and reminders for the day.
 
         This tool should be called automatically when a user first connects to provide them with their daily briefing.
+        You can also call this manually when users ask for their daily briefing.
         """
 
         logger.info("=== get_daily_briefing() function called ===")
@@ -684,7 +685,7 @@ class Assistant(Agent):
             logger.info(f"HR API params: {params}")
             
             logger.info("Making HTTP request to HR API...")
-            async with httpx.AsyncClient(timeout=10.0) as client:
+            async with httpx.AsyncClient(timeout=5.0) as client:
                 response = await client.get(url, params=params)
                 logger.info(f"HR API response status: {response.status_code}")
                 response.raise_for_status()
@@ -735,6 +736,41 @@ class Assistant(Agent):
             import traceback
             logger.error(f"Traceback: {traceback.format_exc()}")
             return "I'm sorry, I encountered an error while retrieving your daily briefing. Please try again or contact HR directly."
+
+    async def get_daily_briefing_with_speech(self):
+        """Get daily briefing and automatically speak it to the user"""
+        try:
+            logger.info("=== get_daily_briefing_with_speech() called ===")
+            
+            # First, speak a quick status message
+            session = getattr(self, '_session', None)
+            if session:
+                await session.say("Let me get your daily briefing for you.")
+            
+            # Get the briefing content with timeout
+            try:
+                briefing_content = await asyncio.wait_for(self.get_daily_briefing(), timeout=8.0)
+            except asyncio.TimeoutError:
+                logger.warning("Daily briefing request timed out, using fallback")
+                briefing_content = "I'm having trouble connecting to the HR system right now. Your daily briefing will be available shortly. In the meantime, feel free to ask me any HR questions!"
+            
+            # Speak the briefing to the user
+            if session and briefing_content:
+                logger.info("Speaking daily briefing to user")
+                await session.say(f"Here's your daily briefing: {briefing_content}")
+                logger.info("Daily briefing spoken successfully")
+            else:
+                logger.warning("No session or briefing content available for speech")
+                
+        except Exception as e:
+            logger.error(f"Error in get_daily_briefing_with_speech: {e}")
+            # Fallback: speak a simple message
+            try:
+                session = getattr(self, '_session', None)
+                if session:
+                    await session.say("I'm preparing your daily briefing. Please give me a moment.")
+            except Exception as fallback_error:
+                logger.error(f"Fallback speech error: {fallback_error}")
 
     @function_tool
     async def query_hr_system(self, query: str):
@@ -1097,11 +1133,11 @@ async def entrypoint(ctx: JobContext):
     # Send automatic greeting after successful connection
     await send_automatic_greeting(session, assistant)
     
-    # Trigger the daily briefing in background (non-blocking)
+    # Trigger the daily briefing in background (non-blocking) with automatic speech
     logger.info("Session started, triggering daily briefing in background")
     try:
         # Run daily briefing in background without blocking
-        asyncio.create_task(assistant.get_daily_briefing())
+        asyncio.create_task(assistant.get_daily_briefing_with_speech())
         logger.info("Daily briefing started in background")
     except Exception as e:
         logger.error(f"Error starting daily briefing: {e}")

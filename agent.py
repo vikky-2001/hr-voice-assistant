@@ -499,8 +499,16 @@ async def send_automatic_greeting(session: AgentSession, assistant: 'Assistant')
     try:
         import asyncio
         
-        # Wait a moment for the connection to fully establish
-        await asyncio.sleep(1)
+        # Wait longer for the connection and TTS to fully establish
+        await asyncio.sleep(2.5)
+        
+        # Pre-warm TTS with a short test phrase to ensure quality
+        try:
+            logger.info("Pre-warming TTS for better audio quality...")
+            await session.say("")  # Empty say to initialize TTS
+            await asyncio.sleep(0.5)  # Brief pause for TTS initialization
+        except Exception as e:
+            logger.debug(f"TTS pre-warm completed: {e}")
         
         # Get user configuration for personalized greeting
         user_config = get_user_config()
@@ -534,12 +542,21 @@ async def send_automatic_greeting(session: AgentSession, assistant: 'Assistant')
             }
         )
         
-        # Actually speak the greeting using the session's say method
+        # Actually speak the greeting using the session's say method with better error handling
         try:
+            # Add a small pause before speaking for better audio quality
+            await asyncio.sleep(0.3)
             await session.say(greeting)
             logger.info("✅ Automatic greeting spoken successfully")
         except Exception as e:
             logger.warning(f"Could not speak automatic greeting: {e}")
+            # Try a simpler fallback greeting
+            try:
+                await asyncio.sleep(0.5)
+                await session.say(f"Hello {user_name}! Your HR assistant is ready to help.")
+                logger.info("✅ Fallback greeting spoken successfully")
+            except Exception as fallback_e:
+                logger.error(f"Could not speak fallback greeting: {fallback_e}")
             logger.info("✅ Automatic greeting sent to frontend (not spoken)")
         
         logger.info("✅ Automatic greeting sent successfully")
@@ -742,9 +759,10 @@ class Assistant(Agent):
         try:
             logger.info("=== get_daily_briefing_with_speech() called ===")
             
-            # First, speak a quick status message
+            # First, speak a quick status message with better timing
             session = getattr(self, '_session', None)
             if session:
+                await asyncio.sleep(0.2)  # Small pause for better audio quality
                 await session.say("Let me get your daily briefing for you.")
             
             # Get the briefing content with timeout
@@ -754,9 +772,10 @@ class Assistant(Agent):
                 logger.warning("Daily briefing request timed out, using fallback")
                 briefing_content = "I'm having trouble connecting to the HR system right now. Your daily briefing will be available shortly. In the meantime, feel free to ask me any HR questions!"
             
-            # Speak the briefing to the user
+            # Speak the briefing to the user with better timing
             if session and briefing_content:
                 logger.info("Speaking daily briefing to user")
+                await asyncio.sleep(0.3)  # Pause for better audio quality
                 await session.say(f"Here's your daily briefing: {briefing_content}")
                 logger.info("Daily briefing spoken successfully")
             else:
@@ -932,7 +951,7 @@ class Assistant(Agent):
 
 
 def prewarm(proc: JobProcess):
-    """Optimized prewarm function with faster VAD loading"""
+    """Optimized prewarm function with faster VAD loading and TTS preparation"""
     logger.info("🔥 Prewarming VAD model...")
     start_time = time.time()
     
@@ -941,6 +960,18 @@ def prewarm(proc: JobProcess):
     
     elapsed = time.time() - start_time
     logger.info(f"✅ VAD prewarm completed in {elapsed:.2f}s")
+    
+    # Pre-warm TTS for better audio quality
+    logger.info("🔥 Prewarming TTS for better audio quality...")
+    try:
+        # Initialize TTS with a test phrase to warm up the model
+        import openai
+        tts = openai.TTS(model="tts-1-hd", voice="nova")
+        proc.userdata["tts_warmed"] = True
+        logger.info("✅ TTS prewarm completed")
+    except Exception as e:
+        logger.warning(f"TTS prewarm failed (will initialize later): {e}")
+        proc.userdata["tts_warmed"] = False
 
 
 async def entrypoint(ctx: JobContext):
@@ -974,10 +1005,10 @@ async def entrypoint(ctx: JobContext):
         llm=openai.LLM(
             model="gpt-4o-mini"
         ),
-        # Text-to-Speech with optimized settings
+        # Text-to-Speech with optimized settings for better quality
         tts=openai.TTS(
-            model="tts-1",
-            voice="alloy"
+            model="tts-1-hd",  # Higher quality model for better clarity
+            voice="nova"       # Nova voice is clearer and more natural
         ),
         # VAD for voice activity detection (preloaded in prewarm)
         vad=ctx.proc.userdata["vad"],

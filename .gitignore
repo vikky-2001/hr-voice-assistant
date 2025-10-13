@@ -118,3 +118,4 @@ frontend.txt
 *.dart
 frontend/
 web/
+frontend-test/

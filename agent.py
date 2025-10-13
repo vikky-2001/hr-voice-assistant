@@ -685,7 +685,7 @@ class Assistant(Agent):
             logger.info(f"HR API params: {params}")
             
             logger.info("Making HTTP request to HR API...")
-            async with httpx.AsyncClient(timeout=5.0) as client:
+            async with httpx.AsyncClient(timeout=15.0) as client:
                 response = await client.get(url, params=params)
                 logger.info(f"HR API response status: {response.status_code}")
                 response.raise_for_status()
@@ -749,7 +749,7 @@ class Assistant(Agent):
             
             # Get the briefing content with timeout
             try:
-                briefing_content = await asyncio.wait_for(self.get_daily_briefing(), timeout=8.0)
+                briefing_content = await asyncio.wait_for(self.get_daily_briefing(), timeout=20.0)
             except asyncio.TimeoutError:
                 logger.warning("Daily briefing request timed out, using fallback")
                 briefing_content = "I'm having trouble connecting to the HR system right now. Your daily briefing will be available shortly. In the meantime, feel free to ask me any HR questions!"
@@ -821,7 +821,7 @@ class Assistant(Agent):
                 "mobile_request": True
             }
             
-            async with httpx.AsyncClient(timeout=10.0) as client:
+            async with httpx.AsyncClient(timeout=15.0) as client:
                 response = await client.get(url, params=params)
                 response.raise_for_status()
                 

@@ -120,3 +120,4 @@ frontend/
 web/
 frontend-test/
 livekit-client.js
+briefing_cache.json

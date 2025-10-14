@@ -1,7 +1,8 @@
 import logging
 import asyncio
 import time
-from datetime import datetime
+import json
+from datetime import datetime, timedelta
 
 from dotenv import load_dotenv
 from livekit.agents import (
@@ -28,6 +29,13 @@ HR_API_ENDPOINT = "/getBotResponse"
 DEFAULT_USER_ID = "79f2b410-bbbe-43b9-a77f-38a6213ce13d"  # Fallback user
 DEFAULT_CHATLOG_ID = 7747  # Fallback chatlog
 DEFAULT_AGENT_ID = 6  # Fallback agent
+
+# Daily Briefing Cache Configuration
+BRIEFING_CACHE_DURATION = 30  # Cache briefing for 30 minutes
+BRIEFING_CACHE_FILE = "briefing_cache.json"  # Single file with user-specific data
+
+# In-memory cache for better performance in containerized environments
+_briefing_cache = {}  # Global in-memory cache: {user_id: {briefing, timestamp}}
 
 logger = logging.getLogger("agent")
 
@@ -494,6 +502,92 @@ async def monitor_long_operation(session: AgentSession, intent_type: str, operat
         logger.error(f"Error starting operation monitoring: {e}")
         return None
 
+
+# Daily Briefing Cache Functions
+def load_briefing_cache():
+    """Load briefing cache - in-memory first, then file backup"""
+    current_user_id = get_user_config().get('user_id', 'default')
+    
+    # Check in-memory cache first (fastest)
+    if current_user_id in _briefing_cache:
+        cache_data = _briefing_cache[current_user_id]
+        cache_time = cache_data['timestamp']
+        
+        if datetime.now() - cache_time < timedelta(minutes=BRIEFING_CACHE_DURATION):
+            logger.info(f"📋 Loaded valid in-memory briefing cache for user {current_user_id} from {cache_time}")
+            return cache_data['briefing']
+        else:
+            logger.info("📋 In-memory briefing cache expired, will fetch fresh data")
+            # Remove expired cache
+            del _briefing_cache[current_user_id]
+    
+    # Fallback to file cache
+    try:
+        with open(BRIEFING_CACHE_FILE, 'r') as f:
+            cache_data = json.load(f)
+            
+        cached_user_id = cache_data.get('user_id', 'unknown')
+        
+        # Check if cache belongs to current user
+        if current_user_id != cached_user_id:
+            logger.info(f"📋 File cache belongs to different user ({cached_user_id}), not using for current user ({current_user_id})")
+            return None
+            
+        # Check if cache is still valid
+        cache_time = datetime.fromisoformat(cache_data['timestamp'])
+        if datetime.now() - cache_time < timedelta(minutes=BRIEFING_CACHE_DURATION):
+            logger.info(f"📋 Loaded valid file briefing cache for user {current_user_id} from {cache_time}")
+            # Load into in-memory cache for faster future access
+            _briefing_cache[current_user_id] = {
+                'briefing': cache_data['briefing'],
+                'timestamp': cache_time
+            }
+            return cache_data['briefing']
+        else:
+            logger.info("📋 File briefing cache expired, will fetch fresh data")
+            return None
+    except (FileNotFoundError, json.JSONDecodeError, KeyError) as e:
+        logger.debug(f"No valid file briefing cache found: {e}")
+        return None
+
+
+def save_briefing_cache(briefing_content: str):
+    """Save briefing content to both in-memory and file cache"""
+    current_user_id = get_user_config().get('user_id', 'default')
+    now = datetime.now()
+    
+    # Save to in-memory cache (fastest access)
+    _briefing_cache[current_user_id] = {
+        'briefing': briefing_content,
+        'timestamp': now
+    }
+    logger.info(f"📋 Briefing saved to in-memory cache for user {current_user_id}")
+    
+    # Also save to file cache (persistence across restarts)
+    try:
+        cache_data = {
+            'briefing': briefing_content,
+            'timestamp': now.isoformat(),
+            'user_id': current_user_id
+        }
+        
+        with open(BRIEFING_CACHE_FILE, 'w') as f:
+            json.dump(cache_data, f, indent=2)
+            
+        logger.info("📋 Briefing cache saved to file successfully")
+    except Exception as e:
+        logger.warning(f"Failed to save briefing cache to file (in-memory cache still works): {e}")
+
+
+def get_cached_briefing():
+    """Get cached briefing if available and valid"""
+    cached_briefing = load_briefing_cache()
+    if cached_briefing:
+        logger.info("🚀 Using cached briefing for instant response")
+        return cached_briefing
+    return None
+
+
 async def send_automatic_greeting(session: AgentSession, assistant: 'Assistant'):
     """Send automatic greeting when connection is established"""
     try:
@@ -664,7 +758,14 @@ class Assistant(Agent):
         """
 
         logger.info("=== get_daily_briefing() function called ===")
-        logger.info("Getting daily briefing from HR system")
+        
+        # Check cache first for instant response
+        cached_briefing = get_cached_briefing()
+        if cached_briefing:
+            logger.info("🚀 Returning cached briefing for instant response")
+            return cached_briefing
+        
+        logger.info("Getting daily briefing from HR system (cache miss)")
 
         # Start intermediate messaging monitoring
         monitor_task = None
@@ -734,6 +835,9 @@ class Assistant(Agent):
                 except Exception as e:
                     logger.error(f"Error sending daily briefing to frontend: {e}")
                 
+                # Save to cache for future instant responses
+                save_briefing_cache(briefing_response)
+                
                 return briefing_response
             
         except httpx.HTTPStatusError as e:
@@ -759,8 +863,19 @@ class Assistant(Agent):
         try:
             logger.info("=== get_daily_briefing_with_speech() called ===")
             
-            # First, speak a quick status message with better timing
+            # Check cache first for instant response
+            cached_briefing = get_cached_briefing()
             session = getattr(self, '_session', None)
+            
+            if cached_briefing and session:
+                # Instant response with cached briefing
+                logger.info("🚀 Speaking cached briefing instantly")
+                await asyncio.sleep(0.2)  # Small pause for better audio quality
+                await session.say(f"Here's your daily briefing: {cached_briefing}")
+                logger.info("✅ Cached daily briefing spoken successfully")
+                return
+            
+            # No cache available, fetch fresh briefing
             if session:
                 await asyncio.sleep(0.2)  # Small pause for better audio quality
                 await session.say("Let me get your daily briefing for you.")

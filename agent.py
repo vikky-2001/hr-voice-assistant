@@ -511,6 +511,7 @@ def load_briefing_cache():
     # Check in-memory cache first (fastest)
     if current_user_id in _briefing_cache:
         cache_data = _briefing_cache[current_user_id]
+        logger.debug("In-memory cache hit for user_id: {} at time: {}", current_user_id, cache_data['timestamp'])
         cache_time = cache_data['timestamp']
         
         if datetime.now() - cache_time < timedelta(minutes=BRIEFING_CACHE_DURATION):
@@ -520,11 +521,14 @@ def load_briefing_cache():
             logger.info("📋 In-memory briefing cache expired, will fetch fresh data")
             # Remove expired cache
             del _briefing_cache[current_user_id]
+    else:
+        logger.debug("In-memory cache miss for user_id: {}", current_user_id)
     
     # Fallback to file cache
     try:
         with open(BRIEFING_CACHE_FILE, 'r') as f:
             cache_data = json.load(f)
+        logger.debug("File cache loaded for user_id: {} at time: {}", cache_data.get('user_id', 'unknown'), cache_data.get('timestamp', 'unknown'))
             
         cached_user_id = cache_data.get('user_id', 'unknown')
         
@@ -549,6 +553,8 @@ def load_briefing_cache():
     except (FileNotFoundError, json.JSONDecodeError, KeyError) as e:
         logger.debug(f"No valid file briefing cache found: {e}")
         return None
+    except Exception as e:
+        logger.warning("Failed to load file briefing cache: {}", str(e))
 
 
 def save_briefing_cache(briefing_content: str):
@@ -561,7 +567,7 @@ def save_briefing_cache(briefing_content: str):
         'briefing': briefing_content,
         'timestamp': now
     }
-    logger.info(f"📋 Briefing saved to in-memory cache for user {current_user_id}")
+    logger.debug("Saving to in-memory cache for user_id: {} at time: {}", current_user_id, now)
     
     # Also save to file cache (persistence across restarts)
     try:
@@ -572,6 +578,7 @@ def save_briefing_cache(briefing_content: str):
         }
         
         with open(BRIEFING_CACHE_FILE, 'w') as f:
+            logger.debug("Writing file cache for user_id: {} at time: {}", current_user_id, now)
             json.dump(cache_data, f, indent=2)
             
         logger.info("📋 Briefing cache saved to file successfully")

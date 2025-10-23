@@ -20,6 +20,7 @@ from livekit.plugins import openai, silero
 import httpx
 from fastapi import FastAPI
 import uvicorn
+import noisereduce as nr
 
 # HR API Configuration
 HR_API_BASE_URL = "https://dev-hrworkerapi.missionmind.ai/api/kafka"
@@ -1072,6 +1073,13 @@ class Assistant(Agent):
             return await self.query_hr_system(user_input)
 
 
+async def process_audio_with_noise_cancellation(audio_data):
+    """Apply noise cancellation to audio data"""
+    # Perform noise reduction
+    reduced_noise_audio = nr.reduce_noise(y=audio_data, sr=16000)
+    return reduced_noise_audio
+
+
 def prewarm(proc: JobProcess):
     """Optimized prewarm function with faster VAD loading and TTS preparation"""
     logger.info("🔥 Prewarming VAD model...")
@@ -1147,21 +1155,27 @@ async def entrypoint(ctx: JobContext):
         session.generate_reply(instructions=ev.extra_instructions or None)
     
     # Send user speech to frontend as text
+    async def process_audio(raw_audio, ev):
+        processed_audio = await process_audio_with_noise_cancellation(raw_audio)
+        stt_result = await session.stt.recognize(processed_audio)
+        await send_text_to_frontend(
+            session=session,
+            message_type="user_speech",
+            content=stt_result,
+            metadata={"source": "user_speech", "timestamp": ev.timestamp}
+        )
+
     @session.on("user_speech_committed")
     def _on_user_speech_committed(ev):
         logger.info(f"User speech committed: {ev.text}")
         try:
             if hasattr(session, 'room') and session.room:
-                asyncio.create_task(send_text_to_frontend(
-                    session=session,
-                    message_type="user_speech",
-                    content=ev.text,
-                    metadata={"source": "user_speech", "timestamp": ev.timestamp}
-                ))
+                raw_audio = ev.audio
+                asyncio.create_task(process_audio(raw_audio, ev))
             else:
                 logger.warning("Session room not available for sending user speech to frontend")
         except Exception as e:
-            logger.error(f"Error sending user speech to frontend: {e}")
+            logger.error(f"Error during audio processing: {e}")
 
     # Send agent responses to frontend as text (exact match with voice)
     @session.on("agent_speech_committed")

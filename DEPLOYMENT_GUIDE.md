@@ -1,4 +1,7 @@
 # 🚀 HR Voice Assistant - LiveKit Cloud Deployment Guide
+lk agent deploy
+lk agent logs
+lk agent list
 
 This document provides a step-by-step guide on how we successfully deployed the HR Voice Assistant to LiveKit Cloud using the CLI.
 

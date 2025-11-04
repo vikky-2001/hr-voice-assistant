@@ -86,8 +86,8 @@ class IntentClassifier:
                 "requires_hr_api": True
             },
             "hr_query": {
-                "keywords": ["policy", "benefits", "leave", "vacation", "sick", "payroll", "salary", "insurance", "retirement"],
-                "patterns": [r"policy", r"benefits", r"leave", r"vacation", r"sick", r"payroll", r"salary", r"insurance", r"retirement"],
+                "keywords": ["policy", "policies", "benefits", "leave", "vacation", "sick", "payroll", "salary", "insurance", "retirement", "workflow", "workflows", "process", "procedure", "how to", "what is", "tell me about", "explain"],
+                "patterns": [r"policy", r"policies", r"benefits", r"leave", r"vacation", r"sick", r"payroll", r"salary", r"insurance", r"retirement", r"workflow", r"workflows", r"process", r"procedure", r"how to", r"what is", r"tell me about", r"explain"],
                 "response": None,  # Will trigger query_hr_system function
                 "requires_hr_api": True
             },
@@ -711,14 +711,23 @@ class Assistant(Agent):
             
             DAILY BRIEFING PROTOCOL: When you receive the message "System trigger: daily briefing", you must:
             1. Immediately call get_daily_briefing() to retrieve their daily briefing information
-            2. Then greet them with: "Hello! I'm your HR assistant. Here's your daily briefing: [provide the briefing content]. How can I help you today? You can ask me about company policies, benefits, leave requests, or any other HR-related questions."
+            2. Then greet them warmly with: "Hello! I'm your HR assistant. Here's your daily briefing: [provide the briefing content in a clear, organized way]. How can I help you today? You can ask me about company policies, benefits, leave requests, HR workflows, or any other HR-related questions."
+            3. When presenting the briefing, make it engaging and easy to understand - don't just read it robotically
             
             IMPORTANT: 
             - Call send_connection_greeting() when user first connects (proactive greeting)
             - Use smart_conversation_handler() for all user interactions
             - When you see "System trigger: daily briefing", call get_daily_briefing() directly
             - Always speak naturally and conversationally
-            - The system will automatically optimize response speed and accuracy""",
+            - The system will automatically optimize response speed and accuracy
+            
+            RESPONSE HANDLING:
+            - When query_hr_system() returns a response, ALWAYS present it to the user in a helpful, conversational way
+            - If the HR API provides information, share it confidently and completely
+            - If the response seems incomplete or unclear, ask follow-up questions to help the user
+            - Never say "I cannot provide" unless you truly have no information - always try to be helpful
+            - For company policies, workflows, and HR information, share whatever information the HR system provides
+            - Be proactive in helping users understand HR processes and policies""",
         )
         
         # Initialize conversation memory
@@ -1061,17 +1070,43 @@ class Assistant(Agent):
 
             logger.info(f"Making request to HR API: {url} with params: {params}")  # Log the request details
 
-            # Adjust the timeout to 30 seconds for the HTTP request
-            async with httpx.AsyncClient(timeout=30.0) as client:
+            # Use a longer timeout for HR queries as they may require more processing
+            timeout = httpx.Timeout(30.0, connect=10.0)  # 30s total, 10s for connection
+            async with httpx.AsyncClient(timeout=timeout) as client:
                 response = await client.get(url, params=params, headers=headers)
                 response.raise_for_status()
                 
-                logger.info(f"Full HTTP Response: status={response.status_code}, body={response.text[:200]}...")  # Log the response status and partial body
+                logger.info(f"Full HTTP Response: status={response.status_code}, body={response.text[:500]}...")  # Log more of the response
 
                 data = response.json()
-                hr_response = data.get("response", "No response received from HR system")
+                hr_response = data.get("response", "")
                 
-                logger.info(f"HR API response received: {hr_response[:100]}...")
+                # Validate the response
+                if not hr_response or hr_response.strip() == "":
+                    logger.warning(f"HR API returned empty response. Full data: {data}")
+                    if monitor_task:
+                        monitor_task.cancel()
+                    return "I'm sorry, I didn't receive a response from the HR system for that question. Could you please rephrase your question or try asking about a specific topic?"
+                
+                # Check for common error indicators in the response
+                hr_response_lower = hr_response.lower()
+                error_indicators = [
+                    "cannot provide",
+                    "cannot help",
+                    "unable to",
+                    "error",
+                    "problem",
+                    "sorry, i don't",
+                    "i don't have access",
+                    "not available"
+                ]
+                
+                if any(indicator in hr_response_lower for indicator in error_indicators) and len(hr_response) < 100:
+                    logger.warning(f"HR API response appears to be an error or unhelpful: {hr_response}")
+                    # Still return it, but log it for debugging
+                
+                logger.info(f"HR API response received: {hr_response[:200]}...")
+                
                 # Stop intermediate messaging monitoring
                 if monitor_task:
                     monitor_task.cancel()
@@ -1086,8 +1121,13 @@ class Assistant(Agent):
             return f"I'm sorry, I encountered an error while looking up that information. Please try again or contact HR directly."
         except httpx.RequestError as e:
             logger.error(f"Request error querying HR system: {e}")
+            import traceback
+            logger.error(f"Full error details: {traceback.format_exc()}")
             if monitor_task:
                 monitor_task.cancel()
+            # Provide more specific error message based on error type
+            if isinstance(e, httpx.TimeoutException):
+                return "I'm sorry, the HR system is taking longer than expected to respond. Please try again in a moment."
             return f"I'm sorry, I'm having trouble connecting to the HR system. Please try again later."
         except Exception as e:
             logger.error(f"Unexpected error querying HR system: {e}")

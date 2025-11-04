@@ -2,7 +2,7 @@ import logging
 import asyncio
 import time
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from dotenv import load_dotenv
 from livekit.agents import (
@@ -16,18 +16,29 @@ from livekit.agents import (
     function_tool,
 )
 from livekit import rtc
-from livekit.plugins import openai, silero
+from livekit.plugins import silero, openai as livekit_openai
+from openai import OpenAI  # ✅ use the official OpenAI SDK
 import httpx
 from fastapi import FastAPI
 import uvicorn
 import noisereduce as nr
+import jwt
+import asyncpg
+import os
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("agent")
 
 # HR API Configuration
 HR_API_BASE_URL = "https://dev-hrworkerapi.missionmind.ai/api/kafka"
+# HR_API_BASE_URL = "https://acarin-hrworkerapi.missionmind.ai/api/kafka"
 HR_API_ENDPOINT = "/getBotResponse"
 
 # Dynamic user configuration - can be overridden by environment variables
 DEFAULT_USER_ID = "79f2b410-bbbe-43b9-a77f-38a6213ce13d"  # Fallback user
+# DEFAULT_USER_ID = "da7fdc93-eb67-45cc-b8a9-dedf23cb8bca"
+
 DEFAULT_CHATLOG_ID = 7747  # Fallback chatlog
 DEFAULT_AGENT_ID = 6  # Fallback agent
 
@@ -38,9 +49,10 @@ BRIEFING_CACHE_FILE = "briefing_cache.json"  # Single file with user-specific da
 # In-memory cache for better performance in containerized environments
 _briefing_cache = {}  # Global in-memory cache: {user_id: {briefing, timestamp}}
 
-logger = logging.getLogger("agent")
-
 load_dotenv(".env.local")
+
+# ✅ Initialize OpenAI client globally
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 # Intent Classification System
 class IntentClassifier:
@@ -523,7 +535,7 @@ def load_briefing_cache():
             # Remove expired cache
             del _briefing_cache[current_user_id]
     else:
-        logger.debug("In-memory cache miss for user_id: {}", current_user_id)
+        logger.debug("In-memory cache miss for user_id: %s", current_user_id)
     
     # Fallback to file cache
     try:
@@ -618,11 +630,11 @@ async def send_automatic_greeting(session: AgentSession, assistant: 'Assistant')
         
         # Create personalized greeting messages
         greeting_options = [
-            f"Hello {user_name}! I'm your HR assistant. How can I help you today?",
-            f"Hi {user_name}! Welcome to your HR assistant. What can I do for you?",
-            f"Good day {user_name}! I'm here to help with any HR questions you might have.",
-            f"Hello {user_name}! Your HR assistant is ready to assist you. How may I help?",
-            f"Hi there {user_name}! I can help you with company policies, benefits, leave requests, and more. What would you like to know?"
+            f"Hello! I'm your HR assistant. How can I help you today?",
+            f"Hi! Welcome to your HR assistant. What can I do for you?",
+            f"Good day! I'm here to help with any HR questions you might have.",
+            f"Hello! Your HR assistant is ready to assist you. How may I help?",
+            f"Hi there! I can help you with company policies, benefits, leave requests, and more. What would you like to know?"
         ]
         
         # Select a greeting (you could randomize this or use time-based selection)
@@ -655,7 +667,7 @@ async def send_automatic_greeting(session: AgentSession, assistant: 'Assistant')
             # Try a simpler fallback greeting
             try:
                 await asyncio.sleep(0.5)
-                await session.say(f"Hello {user_name}! Your HR assistant is ready to help.")
+                await session.say(f"Hello! Your HR assistant is ready to help.")
                 logger.info("✅ Fallback greeting spoken successfully")
             except Exception as fallback_e:
                 logger.error(f"Could not speak fallback greeting: {fallback_e}")
@@ -723,7 +735,7 @@ class Assistant(Agent):
         }
         self.conversation_memory.append(memory_entry)
         
-        # Keep only last 10 interactions to manage memory size
+        # Update to keep last 10 interactions
         if len(self.conversation_memory) > 10:
             self.conversation_memory = self.conversation_memory[-10:]
         
@@ -754,6 +766,65 @@ class Assistant(Agent):
         
         logger.info(f"Intent classification result: {intent_result}")
         return intent_result
+
+    # Function to fetch user details from the database
+    async def fetch_user_details_from_db(self, user_id: str) -> dict:
+        """Fetch tenant_id using user_id from the database."""
+        conn = await asyncpg.connect(
+            user='AN24_Acabot', 
+            password='lAyWkB5FIXghQpvNYM5ggpITC',
+            database='acabotdb-dev', 
+            host='acabot-dbcluster-dev.cluster-cp2eea8yihxz.us-east-1.rds.amazonaws.com',
+            port=5432
+        )
+        try:
+            query = "SELECT tenant_id FROM users WHERE user_id = $1"
+            result = await conn.fetchrow(query, user_id)
+            logger.debug(f"Database query result: {result}")
+
+            if result:
+                return {
+                    "user_id": user_id,
+                    "tenant_id": result["tenant_id"]
+                }
+            else:
+                logger.error("No tenant found for the given user_id.")
+                raise ValueError("Tenant not found")
+        finally:
+            await conn.close()
+
+    # Update _generate_jwt_token to use this function
+    async def _generate_jwt_token(self, user_email: str) -> str:
+        """Generate JWT token for HR Worker API authentication."""
+        user_details = await self.fetch_user_details_from_db(user_email)
+        final_user_id = user_details["user_id"]
+        final_tenant_id = user_details["tenant_id"]
+
+        # Create payload with issued at and expiration time
+        now = datetime.now(timezone.utc)
+        issued_at = int(now.timestamp())
+        expiration_time = now + timedelta(minutes=30)
+        expires_at = int(expiration_time.timestamp())
+
+        payload = {
+            "user_id": final_user_id,
+            "tenant_id": final_tenant_id,
+            "iat": issued_at,
+            "exp": expires_at
+        }
+
+        token = jwt.encode(
+            payload,
+            "missionmind-dev", # Replace with actual JWT secret
+            algorithm="HS256" # Replace with actual algorithm
+        )
+
+        # Log the generated token with limited visibility for debugging
+        logger.info(f"Generated JWT token (partial): {token[:10]}...{token[-10:]}")
+        logger.info(f"Generated JWT token for user: {final_user_id} with expiry at {expires_at}")
+        # Log the full generated token for debugging
+        logger.info(f"Generated JWT token: {token}")
+        return token
 
     # all functions annotated with @function_tool will be passed to the LLM when this
     # agent is active
@@ -797,6 +868,15 @@ class Assistant(Agent):
             # Get dynamic user configuration
             user_config = get_user_config()
             
+            # Ensure user_id is obtained from user configuration
+            user_id = user_config["user_id"]
+
+            # Add JWT token when calling HR API
+            jwt_token = await self._generate_jwt_token(user_id)
+            headers = {
+                "Authorization": f"Bearer {jwt_token}"
+            }
+
             # Call the HR API for daily briefing with dynamic user and chatlog IDs
             url = f"{HR_API_BASE_URL}{HR_API_ENDPOINT}"
             logger.info(f"HR API URL: {url}")
@@ -811,8 +891,10 @@ class Assistant(Agent):
             logger.info(f"HR API params: {params}")
             
             logger.info("Making HTTP request to HR API...")
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                response = await client.get(url, params=params)
+            # Use a longer timeout for daily briefing as it may require more processing
+            timeout = httpx.Timeout(30.0, connect=10.0)  # 30s total, 10s for connection
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                response = await client.get(url, params=params, headers=headers)
                 logger.info(f"HR API response status: {response.status_code}")
                 response.raise_for_status()
                 
@@ -855,8 +937,13 @@ class Assistant(Agent):
             return "I'm sorry, I couldn't retrieve your daily briefing at this time. Please try again later or contact HR directly."
         except httpx.RequestError as e:
             logger.error(f"Request error getting daily briefing: {e}")
+            import traceback
+            logger.error(f"Full error details: {traceback.format_exc()}")
             if monitor_task:
                 monitor_task.cancel()
+            # Provide more specific error message based on error type
+            if isinstance(e, httpx.TimeoutException):
+                return "I'm sorry, the HR system is taking longer than expected to prepare your daily briefing. Please try again in a moment."
             return "I'm sorry, I'm having trouble connecting to the HR system for your daily briefing. Please try again later."
         except Exception as e:
             logger.error(f"Unexpected error getting daily briefing: {e}")
@@ -952,9 +1039,18 @@ class Assistant(Agent):
             # Get dynamic user configuration
             user_config = get_user_config()
             
-            # Call the HR API directly with dynamic user and chatlog IDs
+            # Ensure user_id is obtained from user configuration
+            user_id = user_config["user_id"]
+
+            # Generate JWT token
+            token = await self._generate_jwt_token(user_id)
+
+            headers = {
+                "Authorization": f"Bearer {token}"
+            }
+
+            # Define the URL for the API request
             url = f"{HR_API_BASE_URL}{HR_API_ENDPOINT}"
-            
             params = {
                 "query": query,
                 "user_id": user_config["user_id"],
@@ -962,16 +1058,20 @@ class Assistant(Agent):
                 "agent_id": user_config["agent_id"],
                 "mobile_request": True
             }
-            
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                response = await client.get(url, params=params)
+
+            logger.info(f"Making request to HR API: {url} with params: {params}")  # Log the request details
+
+            # Adjust the timeout to 30 seconds for the HTTP request
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.get(url, params=params, headers=headers)
                 response.raise_for_status()
                 
+                logger.info(f"Full HTTP Response: status={response.status_code}, body={response.text[:200]}...")  # Log the response status and partial body
+
                 data = response.json()
                 hr_response = data.get("response", "No response received from HR system")
                 
                 logger.info(f"HR API response received: {hr_response[:100]}...")
-                
                 # Stop intermediate messaging monitoring
                 if monitor_task:
                     monitor_task.cancel()
@@ -1010,11 +1110,11 @@ class Assistant(Agent):
             
             # Create personalized greeting messages
             greeting_options = [
-                f"Hello {user_name}! I'm your HR assistant. How can I help you today?",
-                f"Hi {user_name}! Welcome to your HR assistant. What can I do for you?",
-                f"Good day {user_name}! I'm here to help with any HR questions you might have.",
-                f"Hello {user_name}! Your HR assistant is ready to assist you. How may I help?",
-                f"Hi there {user_name}! I can help you with company policies, benefits, leave requests, and more. What would you like to know?"
+                f"Hello! I'm your HR assistant. How can I help you today?",
+                f"Hi! Welcome to your HR assistant. What can I do for you?",
+                f"Good day! I'm here to help with any HR questions you might have.",
+                f"Hello! Your HR assistant is ready to assist you. How may I help?",
+                f"Hi there! I can help you with company policies, benefits, leave requests, and more. What would you like to know?"
             ]
             
             # Select a greeting (you could randomize this or use time-based selection)
@@ -1091,17 +1191,23 @@ def prewarm(proc: JobProcess):
     elapsed = time.time() - start_time
     logger.info(f"✅ VAD prewarm completed in {elapsed:.2f}s")
     
-    # Pre-warm TTS for better audio quality
+    # ✅ Pre-warm TTS for better audio quality using OpenAI SDK
     logger.info("🔥 Prewarming TTS for better audio quality...")
     try:
-        # Initialize TTS with a test phrase to warm up the model
-        import openai
-        tts = openai.TTS(model="tts-1-hd", voice="nova")
+        client.audio.speech.create(
+            model="tts-1-hd",
+            voice="nova",
+            input="Testing TTS warmup."
+        )
         proc.userdata["tts_warmed"] = True
-        logger.info("✅ TTS prewarm completed")
+        logger.info("✅ TTS prewarm completed successfully")
     except Exception as e:
         logger.warning(f"TTS prewarm failed (will initialize later): {e}")
         proc.userdata["tts_warmed"] = False
+
+    # Mark models as initialized
+    if not proc.userdata.get("models_initialized"):
+        proc.userdata["models_initialized"] = True
 
 
 async def entrypoint(ctx: JobContext):
@@ -1123,35 +1229,51 @@ async def entrypoint(ctx: JobContext):
     logger.info("🚀 Setting up AgentSession with optimized OpenAI models...")
     start_time = time.time()
     
-    # Initialize models with optimized settings for faster startup
-    session = AgentSession(
-        # Speech-to-Text with optimized settings
-        stt=openai.STT(
-            model="whisper-1",
-            # Use faster processing mode
-            language="en"  # Specify language for faster processing
-        ),
-        # LLM with optimized settings
-        llm=openai.LLM(
-            model="gpt-4o-mini"
-        ),
-        # Text-to-Speech with optimized settings for better quality
-        tts=openai.TTS(
-            model="tts-1-hd",  # Higher quality model for better clarity
-            voice="nova"       # Nova voice is clearer and more natural
-        ),
-        # VAD for voice activity detection (preloaded in prewarm)
-        vad=ctx.proc.userdata["vad"],
-    )
-    
-    elapsed = time.time() - start_time
-    logger.info(f"✅ AgentSession created successfully in {elapsed:.2f}s")
+    try:
+        # Initialize models with optimized settings for faster startup
+        # Use LiveKit's OpenAI plugins (not the OpenAI SDK client directly)
+        session = AgentSession(
+            stt=livekit_openai.STT(model="whisper-1", language="en"),
+            llm=livekit_openai.LLM(model="gpt-4o-mini"),
+            tts=livekit_openai.TTS(model="tts-1-hd", voice="nova"),
+            vad=ctx.proc.userdata["vad"],
+        )
+        
+        elapsed = time.time() - start_time
+        logger.info(f"✅ AgentSession created successfully in {elapsed:.2f}s")
+    except Exception as e:
+        logger.error(f"Failed to create AgentSession: {e}")
+        import traceback
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        raise  # Re-raise to let LiveKit handle the error
 
-    # sometimes background noise could interrupt the agent session, these are considered false positive interruptions
-    # when it's detected, you may resume the agent's speech
+    # Resilient error handling during session start
+    try:
+        # Define the assistant variable earlier before its use
+        assistant = Assistant()
+        assistant._session = session  # Pass session to assistant for frontend communication
+
+        # Start the session with optimized settings for faster initialization
+        logger.info("🚀 Starting AgentSession with optimized settings...")
+        start_time = time.time()
+
+        await session.start(
+            agent=assistant,
+            room=ctx.room,
+        )
+
+        elapsed = time.time() - start_time
+        logger.info(f"✅ AgentSession started successfully in {elapsed:.2f}s")
+    except Exception as e:
+        logger.error(f"Failed to start session: {e}")
+        import traceback
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        raise  # Re-raise to let LiveKit handle the error properly
+
+    # Handle false positive interruptions
     @session.on("agent_false_interruption")
     def _on_agent_false_interruption(ev):
-        logger.info("false positive interruption, resuming")
+        logger.info("Detected false positive interruption, resuming")
         session.generate_reply(instructions=ev.extra_instructions or None)
     
     # Send user speech to frontend as text

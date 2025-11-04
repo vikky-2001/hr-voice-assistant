@@ -25,6 +25,8 @@ import noisereduce as nr
 import jwt
 import asyncpg
 import os
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -48,6 +50,18 @@ BRIEFING_CACHE_FILE = "briefing_cache.json"  # Single file with user-specific da
 
 # In-memory cache for better performance in containerized environments
 _briefing_cache = {}  # Global in-memory cache: {user_id: {briefing, timestamp}}
+
+# Database configuration (using same connection details as fetch_user_details_from_db)
+DB_CONFIG = {
+    'user': 'AN24_Acabot',
+    'password': 'lAyWkB5FIXghQpvNYM5ggpITC',
+    'database': 'acabotdb-dev',
+    'host': 'acabot-dbcluster-dev.cluster-cp2eea8yihxz.us-east-1.rds.amazonaws.com',
+    'port': 5432
+}
+
+# Scheduler for scheduled briefing tasks
+scheduler = AsyncIOScheduler()
 
 load_dotenv(".env.local")
 
@@ -516,7 +530,324 @@ async def monitor_long_operation(session: AgentSession, intent_type: str, operat
         return None
 
 
+# Database Briefing Storage Functions
+async def get_db_connection():
+    """Get a database connection"""
+    return await asyncpg.connect(**DB_CONFIG)
+
+async def ensure_briefing_table_exists():
+    """Ensure the briefing_cache table exists in the database"""
+    conn = await get_db_connection()
+    try:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS briefing_cache (
+                id SERIAL PRIMARY KEY,
+                user_id VARCHAR(255) NOT NULL,
+                briefing_content TEXT NOT NULL,
+                cache_type VARCHAR(20) NOT NULL DEFAULT 'general',  -- 'morning', 'evening', or 'general'
+                cache_date DATE NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(user_id, cache_date, cache_type)
+            );
+            CREATE INDEX IF NOT EXISTS idx_briefing_cache_user_date ON briefing_cache(user_id, cache_date);
+        """)
+        logger.info("✅ Briefing cache table ensured to exist")
+    except Exception as e:
+        logger.error(f"❌ Error ensuring briefing table exists: {e}")
+    finally:
+        await conn.close()
+
+async def save_briefing_to_db(user_id: str, briefing_content: str, cache_type: str = 'general'):
+    """
+    Save or update briefing in database for a user.
+    
+    Args:
+        user_id: The user ID
+        briefing_content: The briefing content
+        cache_type: 'morning', 'evening', or 'general'
+    """
+    await ensure_briefing_table_exists()
+    conn = await get_db_connection()
+    try:
+        today = datetime.now().date()
+        
+        # Use INSERT ... ON CONFLICT to update if record exists
+        await conn.execute("""
+            INSERT INTO briefing_cache (user_id, briefing_content, cache_type, cache_date, updated_at)
+            VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)
+            ON CONFLICT (user_id, cache_date, cache_type)
+            DO UPDATE SET
+                briefing_content = EXCLUDED.briefing_content,
+                updated_at = CURRENT_TIMESTAMP
+        """, user_id, briefing_content, cache_type, today)
+        
+        logger.info(f"✅ Briefing saved to database for user {user_id} (type: {cache_type})")
+    except Exception as e:
+        logger.error(f"❌ Error saving briefing to database: {e}")
+    finally:
+        await conn.close()
+
+async def user_has_briefing_in_db(user_id: str) -> bool:
+    """
+    Check if a user has any briefing record in the database for today.
+    
+    Args:
+        user_id: The user ID
+    
+    Returns:
+        True if user has a briefing record, False otherwise
+    """
+    await ensure_briefing_table_exists()
+    conn = await get_db_connection()
+    try:
+        today = datetime.now().date()
+        result = await conn.fetchval("""
+            SELECT COUNT(*) 
+            FROM briefing_cache 
+            WHERE user_id = $1 AND cache_date = $2
+        """, user_id, today)
+        return result > 0 if result else False
+    except Exception as e:
+        logger.error(f"❌ Error checking if user has briefing: {e}")
+        return False
+    finally:
+        await conn.close()
+
+async def load_briefing_from_db(user_id: str, cache_type: str = None) -> str:
+    """
+    Load briefing from database for a user.
+    
+    Args:
+        user_id: The user ID
+        cache_type: Optional filter by cache type ('morning', 'evening', or None for any)
+    
+    Returns:
+        Briefing content if found, None otherwise
+    """
+    await ensure_briefing_table_exists()
+    conn = await get_db_connection()
+    try:
+        today = datetime.now().date()
+        
+        if cache_type:
+            result = await conn.fetchrow("""
+                SELECT briefing_content, updated_at 
+                FROM briefing_cache 
+                WHERE user_id = $1 AND cache_date = $2 AND cache_type = $3
+                ORDER BY updated_at DESC
+                LIMIT 1
+            """, user_id, today, cache_type)
+        else:
+            # Get the most recent briefing for today (prefer evening, then morning, then general)
+            result = await conn.fetchrow("""
+                SELECT briefing_content, updated_at 
+                FROM briefing_cache 
+                WHERE user_id = $1 AND cache_date = $2
+                ORDER BY 
+                    CASE cache_type 
+                        WHEN 'evening' THEN 1
+                        WHEN 'morning' THEN 2
+                        ELSE 3
+                    END,
+                    updated_at DESC
+                LIMIT 1
+            """, user_id, today)
+        
+        if result:
+            logger.info(f"📋 Loaded briefing from database for user {user_id}")
+            return result['briefing_content']
+        else:
+            logger.debug(f"No briefing found in database for user {user_id} on {today}")
+            return None
+    except Exception as e:
+        logger.error(f"❌ Error loading briefing from database: {e}")
+        return None
+    finally:
+        await conn.close()
+
+async def get_all_active_users():
+    """Get all active users from the database"""
+    conn = await get_db_connection()
+    try:
+        # Get all users from the users table
+        # Adjust this query based on your actual users table structure
+        users = await conn.fetch("""
+            SELECT DISTINCT user_id 
+            FROM users 
+            WHERE user_id IS NOT NULL
+        """)
+        user_ids = [row['user_id'] for row in users]
+        logger.info(f"Found {len(user_ids)} active users in database")
+        return user_ids
+    except Exception as e:
+        logger.error(f"❌ Error fetching active users: {e}")
+        return []
+    finally:
+        await conn.close()
+
+async def fetch_and_cache_briefing_for_user(user_id: str, cache_type: str = 'general'):
+    """
+    Fetch briefing from HR API and cache it in database for a specific user.
+    
+    Args:
+        user_id: The user ID
+        cache_type: 'morning', 'evening', or 'general'
+    """
+    try:
+        logger.info(f"🔄 Fetching briefing for user {user_id} (type: {cache_type})")
+        
+        # Create a temporary Assistant instance to use its methods
+        # We'll need to get user config for this user
+        assistant = Assistant()
+        
+        # Get user configuration - we'll need to fetch chatlog_id and agent_id from DB
+        conn = await get_db_connection()
+        try:
+            user_config_query = await conn.fetchrow("""
+                SELECT user_id, tenant_id 
+                FROM users 
+                WHERE user_id = $1
+            """, user_id)
+            
+            if not user_config_query:
+                logger.warning(f"User {user_id} not found in database")
+                return
+            
+            # Use default chatlog_id and agent_id (you may want to store these per user)
+            user_config = {
+                "user_id": user_id,
+                "chatlog_id": DEFAULT_CHATLOG_ID,
+                "agent_id": DEFAULT_AGENT_ID,
+                "tenant_id": user_config_query['tenant_id']
+            }
+        finally:
+            await conn.close()
+        
+        # Generate JWT token
+        jwt_token = await assistant._generate_jwt_token(user_id)
+        headers = {
+            "Authorization": f"Bearer {jwt_token}"
+        }
+        
+        # Call HR API for briefing
+        url = f"{HR_API_BASE_URL}{HR_API_ENDPOINT}"
+        params = {
+            "query": "System trigger: daily briefing",
+            "user_id": user_id,
+            "chatlog_id": user_config["chatlog_id"],
+            "agent_id": user_config["agent_id"],
+            "mobile_request": True
+        }
+        
+        timeout = httpx.Timeout(30.0, connect=10.0)
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.get(url, params=params, headers=headers)
+            response.raise_for_status()
+            
+            data = response.json()
+            briefing_response = data.get("response", "No daily briefing available at this time")
+            
+            # Save to database
+            await save_briefing_to_db(user_id, briefing_response, cache_type)
+            
+            # Also update in-memory cache
+            _briefing_cache[user_id] = {
+                'briefing': briefing_response,
+                'timestamp': datetime.now()
+            }
+            
+            logger.info(f"✅ Briefing fetched and cached for user {user_id} (type: {cache_type})")
+            
+    except Exception as e:
+        logger.error(f"❌ Error fetching briefing for user {user_id}: {e}")
+        import traceback
+        logger.error(f"Traceback: {traceback.format_exc()}")
+
+async def scheduled_briefing_task(cache_type: str):
+    """
+    Scheduled task to fetch and cache briefings for all active users.
+    
+    Args:
+        cache_type: 'morning' (5 AM) or 'evening' (5 PM)
+    """
+    logger.info(f"⏰ Starting scheduled briefing task ({cache_type})")
+    
+    try:
+        # Get all active users
+        user_ids = await get_all_active_users()
+        
+        if not user_ids:
+            logger.warning("No active users found for briefing generation")
+            return
+        
+        # Fetch briefings for all users concurrently (with limit to avoid overwhelming the API)
+        # Process in batches to avoid rate limits
+        batch_size = 10
+        for i in range(0, len(user_ids), batch_size):
+            batch = user_ids[i:i + batch_size]
+            tasks = [fetch_and_cache_briefing_for_user(user_id, cache_type) for user_id in batch]
+            await asyncio.gather(*tasks, return_exceptions=True)
+            # Small delay between batches
+            await asyncio.sleep(2)
+        
+        logger.info(f"✅ Scheduled briefing task completed ({cache_type}) for {len(user_ids)} users")
+        
+    except Exception as e:
+        logger.error(f"❌ Error in scheduled briefing task: {e}")
+        import traceback
+        logger.error(f"Traceback: {traceback.format_exc()}")
+
+def start_scheduled_briefing_tasks():
+    """Start the scheduled briefing tasks for 5 AM and 5 PM"""
+    if scheduler.running:
+        logger.info("Scheduler already running, skipping startup")
+        return
+    
+    # Schedule morning briefing at 5:00 AM
+    scheduler.add_job(
+        scheduled_briefing_task,
+        CronTrigger(hour=5, minute=0),
+        args=['morning'],
+        id='morning_briefing',
+        name='Morning Briefing (5 AM)',
+        replace_existing=True
+    )
+    
+    # Schedule evening briefing at 5:00 PM
+    scheduler.add_job(
+        scheduled_briefing_task,
+        CronTrigger(hour=17, minute=0),
+        args=['evening'],
+        id='evening_briefing',
+        name='Evening Briefing (5 PM)',
+        replace_existing=True
+    )
+    
+    scheduler.start()
+    logger.info("✅ Scheduled briefing tasks started (5 AM and 5 PM)")
+
+
 # Daily Briefing Cache Functions
+async def load_briefing_cache_async():
+    """Load briefing cache - database first, then in-memory, then file backup (async)"""
+    current_user_id = get_user_config().get('user_id', 'default')
+    
+    # Check database first (most reliable)
+    db_briefing = await load_briefing_from_db(current_user_id)
+    if db_briefing:
+        # Update in-memory cache for faster future access
+        _briefing_cache[current_user_id] = {
+            'briefing': db_briefing,
+            'timestamp': datetime.now()
+        }
+        logger.info(f"📋 Loaded briefing from database for user {current_user_id}")
+        return db_briefing
+    
+    # If no briefing in database, check in-memory/file cache as fallback
+    # Note: First-time users will have briefing fetched and created in get_daily_briefing()
+    return load_briefing_cache()
+
 def load_briefing_cache():
     """Load briefing cache - in-memory first, then file backup"""
     current_user_id = get_user_config().get('user_id', 'default')
@@ -570,8 +901,39 @@ def load_briefing_cache():
         logger.warning("Failed to load file briefing cache: {}", str(e))
 
 
+async def save_briefing_cache_async(briefing_content: str, cache_type: str = 'general'):
+    """Save briefing content to database, in-memory, and file cache (async)"""
+    current_user_id = get_user_config().get('user_id', 'default')
+    now = datetime.now()
+    
+    # Save to database (most reliable)
+    await save_briefing_to_db(current_user_id, briefing_content, cache_type)
+    
+    # Save to in-memory cache (fastest access)
+    _briefing_cache[current_user_id] = {
+        'briefing': briefing_content,
+        'timestamp': now
+    }
+    logger.debug("Saving to in-memory cache for user_id: {} at time: {}", current_user_id, now)
+    
+    # Also save to file cache (persistence across restarts)
+    try:
+        cache_data = {
+            'briefing': briefing_content,
+            'timestamp': now.isoformat(),
+            'user_id': current_user_id
+        }
+        
+        with open(BRIEFING_CACHE_FILE, 'w') as f:
+            logger.debug("Writing file cache for user_id: {} at time: {}", current_user_id, now)
+            json.dump(cache_data, f, indent=2)
+            
+        logger.info("📋 Briefing cache saved to file successfully")
+    except Exception as e:
+        logger.warning(f"Failed to save briefing cache to file (in-memory cache still works): {e}")
+
 def save_briefing_cache(briefing_content: str):
-    """Save briefing content to both in-memory and file cache"""
+    """Save briefing content to both in-memory and file cache (sync version for backward compatibility)"""
     current_user_id = get_user_config().get('user_id', 'default')
     now = datetime.now()
     
@@ -597,10 +959,24 @@ def save_briefing_cache(briefing_content: str):
         logger.info("📋 Briefing cache saved to file successfully")
     except Exception as e:
         logger.warning(f"Failed to save briefing cache to file (in-memory cache still works): {e}")
+    
+    # Also save to database asynchronously (non-blocking)
+    try:
+        asyncio.create_task(save_briefing_cache_async(briefing_content, 'general'))
+    except Exception as e:
+        logger.warning(f"Failed to save briefing to database (non-blocking): {e}")
 
+
+async def get_cached_briefing_async():
+    """Get cached briefing if available and valid (async, checks database first)"""
+    cached_briefing = await load_briefing_cache_async()
+    if cached_briefing:
+        logger.info("🚀 Using cached briefing for instant response")
+        return cached_briefing
+    return None
 
 def get_cached_briefing():
-    """Get cached briefing if available and valid"""
+    """Get cached briefing if available and valid (sync version, checks in-memory/file cache)"""
     cached_briefing = load_briefing_cache()
     if cached_briefing:
         logger.info("🚀 Using cached briefing for instant response")
@@ -847,13 +1223,33 @@ class Assistant(Agent):
 
         logger.info("=== get_daily_briefing() function called ===")
         
-        # Check cache first for instant response
+        # Get user configuration
+        user_config = get_user_config()
+        user_id = user_config["user_id"]
+        
+        # Check database cache first (most reliable)
+        db_briefing = await load_briefing_from_db(user_id)
+        if db_briefing:
+            logger.info(f"✅ Returning existing briefing from database for user {user_id}")
+            # Update in-memory cache for faster future access
+            _briefing_cache[user_id] = {
+                'briefing': db_briefing,
+                'timestamp': datetime.now()
+            }
+            return db_briefing
+        
+        # No briefing found in database - this is a first-time user or briefing not yet generated
+        logger.info(f"📝 No briefing found in database for user {user_id} - fetching and creating record...")
+        
+        # Fallback to in-memory/file cache while we fetch (for faster initial response)
         cached_briefing = get_cached_briefing()
         if cached_briefing:
-            logger.info("🚀 Returning cached briefing for instant response")
+            logger.info("🚀 Using in-memory/file cache while fetching fresh briefing...")
+            # Still fetch in background to update database
+            asyncio.create_task(fetch_and_cache_briefing_for_user(user_id, 'general'))
             return cached_briefing
         
-        logger.info("Getting daily briefing from HR system (cache miss)")
+        logger.info("Getting daily briefing from HR system (no cache found)")
 
         # Start intermediate messaging monitoring
         monitor_task = None
@@ -934,8 +1330,8 @@ class Assistant(Agent):
                 except Exception as e:
                     logger.error(f"Error sending daily briefing to frontend: {e}")
                 
-                # Save to cache for future instant responses
-                save_briefing_cache(briefing_response)
+                # Save to cache for future instant responses (database, in-memory, and file)
+                await save_briefing_cache_async(briefing_response, 'general')
                 
                 return briefing_response
             
@@ -1261,9 +1657,33 @@ async def entrypoint(ctx: JobContext):
     logger.info(f"Room: {ctx.room.name}")
     logger.info("🚀 Startup optimizations enabled for faster initialization")
     
+    # Start scheduled briefing tasks (5 AM and 5 PM)
+    # This will only start once, even if multiple entrypoints are called
+    try:
+        start_scheduled_briefing_tasks()
+    except Exception as e:
+        logger.warning(f"Could not start scheduled briefing tasks: {e}")
+    
     # Get user configuration based on room context
     user_config = get_user_config(room_name=ctx.room.name)
     logger.info(f"Initial user config: {user_config}")
+    
+    # Check if briefing exists for this user, if not create one (first-time user)
+    try:
+        user_id = user_config.get("user_id")
+        if user_id:
+            # Check if user has any briefing record in database for today
+            has_briefing = await user_has_briefing_in_db(user_id)
+            if not has_briefing:
+                # First-time user - no briefing found in table, fetch and create record
+                logger.info(f"👤 First-time user detected ({user_id}) - no briefing record in database, fetching and creating...")
+                # Fetch in background to create the record (will be available when user requests briefing)
+                asyncio.create_task(fetch_and_cache_briefing_for_user(user_id, 'general'))
+            else:
+                # Existing user - briefing record exists in table, will be retrieved from there
+                logger.info(f"✅ Existing user ({user_id}) - briefing record found in database table")
+    except Exception as e:
+        logger.warning(f"Could not check briefing for user: {e}")
 
     # Set up a complete voice AI pipeline with optimized OpenAI models
     logger.info("🚀 Setting up AgentSession with optimized OpenAI models...")
@@ -1517,6 +1937,12 @@ def start_health_server():
     uvicorn.run(health_app, host="0.0.0.0", port=8080, log_level="info")
 
 if __name__ == "__main__":
+    # Ensure briefing table exists on startup
+    try:
+        asyncio.run(ensure_briefing_table_exists())
+    except Exception as e:
+        logger.warning(f"Could not ensure briefing table exists on startup: {e}")
+    
     # Start health server in background
     import threading
     health_thread = threading.Thread(target=start_health_server, daemon=True)

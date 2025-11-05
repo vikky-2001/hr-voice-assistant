@@ -445,7 +445,10 @@ def lookup_user_by_identity(participant_identity: str) -> str:
     return None
 
 async def send_text_to_frontend(session: AgentSession, message_type: str, content: str, metadata: dict = None):
-    """Send structured text data to the frontend via LiveKit data channel"""
+    """Send structured text data to the frontend via LiveKit data channel
+    
+    Automatically chunks large content to avoid buffer overflow errors.
+    """
     try:
         import json
         
@@ -463,20 +466,106 @@ async def send_text_to_frontend(session: AgentSession, message_type: str, conten
             logger.debug(f"No remote participants connected for sending {message_type} to frontend")
             return
         
-        data = {
-            "type": message_type,
-            "content": content,
-            "timestamp": datetime.now().isoformat(),
-            "metadata": metadata or {}
-        }
+        # Maximum size for data channel messages (conservative limit to avoid scanner errors)
+        # LiveKit typically supports up to 64KB, but we use 32KB to be safe
+        MAX_MESSAGE_SIZE = 32 * 1024  # 32KB in bytes
+        MAX_CONTENT_SIZE = 28 * 1024  # Leave room for JSON overhead
         
-        # Send as data message to all participants
-        await session.room.local_participant.publish_data(
-            data=json.dumps(data).encode('utf-8'),
-            topic="chat"
-        )
-        
-        logger.info(f"Sent {message_type} to frontend: {content[:100]}...")
+        # If content is too large, chunk it
+        if len(content.encode('utf-8')) > MAX_CONTENT_SIZE:
+            logger.info(f"Content too large ({len(content)} bytes), chunking into smaller messages")
+            
+            # Split content into chunks
+            chunk_size = MAX_CONTENT_SIZE
+            chunks = []
+            content_bytes = content.encode('utf-8')
+            
+            for i in range(0, len(content_bytes), chunk_size):
+                chunk_text = content_bytes[i:i+chunk_size].decode('utf-8', errors='ignore')
+                chunks.append(chunk_text)
+            
+            # Send each chunk as a separate message
+            total_chunks = len(chunks)
+            for idx, chunk in enumerate(chunks):
+                chunk_metadata = (metadata or {}).copy()
+                chunk_metadata.update({
+                    "is_chunked": True,
+                    "chunk_index": idx,
+                    "total_chunks": total_chunks,
+                    "original_size": len(content)
+                })
+                
+                data = {
+                    "type": message_type,
+                    "content": chunk,
+                    "timestamp": datetime.now().isoformat(),
+                    "metadata": chunk_metadata
+                }
+                
+                json_data = json.dumps(data)
+                json_size = len(json_data.encode('utf-8'))
+                
+                # Safety check: if JSON is still too large, truncate content further
+                if json_size > MAX_MESSAGE_SIZE:
+                    # Calculate how much to reduce content
+                    overhead = json_size - len(chunk.encode('utf-8'))
+                    max_content = MAX_MESSAGE_SIZE - overhead - 100  # Safety margin
+                    
+                    if max_content > 0:
+                        chunk = chunk[:max_content]
+                        data["content"] = chunk
+                        json_data = json.dumps(data)
+                    else:
+                        logger.error(f"Message too large even after truncation, skipping chunk {idx}")
+                        continue
+                
+                await session.room.local_participant.publish_data(
+                    data=json_data.encode('utf-8'),
+                    topic="chat"
+                )
+                
+                # Small delay between chunks to avoid overwhelming the channel
+                if idx < total_chunks - 1:
+                    await asyncio.sleep(0.05)
+            
+            logger.info(f"Sent {message_type} to frontend in {total_chunks} chunks (total: {len(content)} bytes)")
+        else:
+            # Normal size message - send as-is
+            data = {
+                "type": message_type,
+                "content": content,
+                "timestamp": datetime.now().isoformat(),
+                "metadata": metadata or {}
+            }
+            
+            json_data = json.dumps(data)
+            json_size = len(json_data.encode('utf-8'))
+            
+            # Final safety check
+            if json_size > MAX_MESSAGE_SIZE:
+                logger.warning(f"JSON message size ({json_size} bytes) exceeds limit, truncating content")
+                # Truncate content to fit
+                overhead = json_size - len(content.encode('utf-8'))
+                max_content = MAX_MESSAGE_SIZE - overhead - 100
+                
+                if max_content > 0:
+                    data["content"] = content[:max_content]
+                    data["metadata"] = (metadata or {}).copy()
+                    data["metadata"]["truncated"] = True
+                    data["metadata"]["original_size"] = len(content)
+                    json_data = json.dumps(data)
+                else:
+                    logger.error(f"Message too large even after truncation, skipping")
+                    return
+            
+            await session.room.local_participant.publish_data(
+                data=json_data.encode('utf-8'),
+                topic="chat"
+            )
+            
+            # Truncate log message to prevent very long log lines
+            log_content = content[:200] + "..." if len(content) > 200 else content
+            logger.info(f"Sent {message_type} to frontend: {log_content}")
         
     except Exception as e:
         logger.error(f"Error sending text to frontend: {e}")
@@ -992,13 +1081,9 @@ async def send_automatic_greeting(session: AgentSession, assistant: 'Assistant')
         # Wait longer for the connection and TTS to fully establish
         await asyncio.sleep(2.5)
         
-        # Pre-warm TTS with a short test phrase to ensure quality
-        try:
-            logger.info("Pre-warming TTS for better audio quality...")
-            await session.say("")  # Empty say to initialize TTS
-            await asyncio.sleep(0.5)  # Brief pause for TTS initialization
-        except Exception as e:
-            logger.debug(f"TTS pre-warm completed: {e}")
+        # TTS will be initialized automatically when we first speak
+        # No need to pre-warm with a spoken phrase
+        logger.info("TTS will initialize on first speech")
         
         # Get user configuration for personalized greeting
         user_config = get_user_config()
@@ -1072,13 +1157,15 @@ class Assistant(Agent):
             3. Route to appropriate function automatically
             4. Remember conversation context for follow-up questions
             
+            CRITICAL: After calling ANY function tool, you MUST speak the response to the user. Function tools return information, but you need to present it conversationally. Never just return function results silently - always speak them naturally.
+            
             CONVERSATION FLOW:
             1. User connects → You call send_connection_greeting() (automatic welcome)
             2. User speaks → You call smart_conversation_handler(user_input)
             3. Function classifies intent and determines response strategy
             4. For greetings/farewells/help → Direct response (fast)
             5. For HR queries/complaints → HR API call (comprehensive)
-            6. Response is spoken back to user
+            6. ALWAYS speak the response back to the user - present function results naturally and conversationally
             
             CONTEXT AWARENESS:
             - The system remembers recent conversation topics
@@ -1098,12 +1185,16 @@ class Assistant(Agent):
             - The system will automatically optimize response speed and accuracy
             
             RESPONSE HANDLING:
-            - When query_hr_system() returns a response, ALWAYS present it to the user in a helpful, conversational way
-            - If the HR API provides information, share it confidently and completely
+            - When query_hr_system() returns a response, ALWAYS SPEAK it to the user in a helpful, conversational way
+            - When smart_conversation_handler() returns a response, ALWAYS SPEAK it to the user
+            - When get_daily_briefing() returns content, ALWAYS SPEAK it to the user naturally
+            - NEVER silently return function results - you must SPEAK everything you learn from function calls
+            - If the HR API provides information, share it confidently and completely by SPEAKING it
             - If the response seems incomplete or unclear, ask follow-up questions to help the user
             - Never say "I cannot provide" unless you truly have no information - always try to be helpful
-            - For company policies, workflows, and HR information, share whatever information the HR system provides
-            - Be proactive in helping users understand HR processes and policies""",
+            - For company policies, workflows, and HR information, share whatever information the HR system provides by SPEAKING it
+            - Be proactive in helping users understand HR processes and policies
+            - Remember: Your responses are automatically converted to speech via TTS, so generate natural spoken text""",
         )
         
         # Initialize conversation memory
@@ -1304,7 +1395,12 @@ class Assistant(Agent):
                 response.raise_for_status()
                 
                 data = response.json()
-                logger.info(f"HR API response data: {data}")
+                # Truncate long response data in logs to avoid scanner errors
+                data_str = str(data)
+                if len(data_str) > 500:
+                    logger.info(f"HR API response data: {data_str[:500]}... (truncated, {len(data_str)} total)")
+                else:
+                    logger.info(f"HR API response data: {data_str}")
                 briefing_response = data.get("response", "No daily briefing available at this time")
                 
                 logger.info(f"Daily briefing received: {briefing_response[:100]}...")
@@ -1336,7 +1432,9 @@ class Assistant(Agent):
                 return briefing_response
             
         except httpx.HTTPStatusError as e:
-            logger.error(f"HTTP error getting daily briefing: {e.response.status_code} - {e.response.text}")
+            # Truncate long error responses to avoid scanner errors
+            error_text = e.response.text[:500] + "..." if len(e.response.text) > 500 else e.response.text
+            logger.error(f"HTTP error getting daily briefing: {e.response.status_code} - {error_text}")
             if monitor_task:
                 monitor_task.cancel()
             return "I'm sorry, I couldn't retrieve your daily briefing at this time. Please try again later or contact HR directly."
@@ -1511,7 +1609,9 @@ class Assistant(Agent):
                 return hr_response
             
         except httpx.HTTPStatusError as e:
-            logger.error(f"HTTP error querying HR system: {e.response.status_code} - {e.response.text}")
+            # Truncate long error responses to avoid scanner errors
+            error_text = e.response.text[:500] + "..." if len(e.response.text) > 500 else e.response.text
+            logger.error(f"HTTP error querying HR system: {e.response.status_code} - {error_text}")
             if monitor_task:
                 monitor_task.cancel()
             return f"I'm sorry, I encountered an error while looking up that information. Please try again or contact HR directly."
@@ -1573,6 +1673,13 @@ class Assistant(Agent):
                         "timestamp": datetime.now().isoformat()
                     }
                 )
+                
+                # Also speak the greeting directly
+                try:
+                    await session.say(greeting)
+                    logger.info("✅ Connection greeting spoken successfully")
+                except Exception as e:
+                    logger.error(f"❌ Error speaking connection greeting: {e}")
             
             return greeting
             
@@ -1724,6 +1831,8 @@ async def entrypoint(ctx: JobContext):
 
         elapsed = time.time() - start_time
         logger.info(f"✅ AgentSession started successfully in {elapsed:.2f}s")
+        logger.info("✅ TTS configured: tts-1-hd with voice 'nova'")
+        logger.info("✅ AgentSession will automatically speak all LLM text responses")
     except Exception as e:
         logger.error(f"Failed to start session: {e}")
         import traceback
@@ -1762,7 +1871,7 @@ async def entrypoint(ctx: JobContext):
     # Send agent responses to frontend as text (exact match with voice)
     @session.on("agent_speech_committed")
     def _on_agent_speech_committed(ev):
-        logger.info(f"Agent speech committed: {ev.text}")
+        logger.info(f"🔊 Agent speech committed (spoken to user): {ev.text[:100]}...")
         try:
             if hasattr(session, 'room') and session.room:
                 asyncio.create_task(send_text_to_frontend(
@@ -1779,7 +1888,7 @@ async def entrypoint(ctx: JobContext):
     # Send agent speech start notification (optional - for UI indicators)
     @session.on("agent_speech_started")
     def _on_agent_speech_started(ev):
-        logger.info("Agent started speaking")
+        logger.info("🔊 Agent started speaking - TTS is working!")
         # Note: We don't send generic text here since we'll send the exact text via agent_speech_committed
 
     # Send live transcripts as the agent speaks (real-time)
@@ -1819,9 +1928,17 @@ async def entrypoint(ctx: JobContext):
     # Handle data channel messages from frontend
     @session.on("data_received")
     def _on_data_received(ev):
-        logger.info(f"Data received from frontend: {ev.data[:100]}...")
+        # Truncate log message to prevent very long log lines
+        data_preview = ev.data[:100] + b"..." if len(ev.data) > 100 else ev.data
+        logger.info(f"Data received from frontend: {data_preview}...")
         try:
             import json
+            # Safety check: limit incoming data size to prevent scanner errors
+            MAX_INCOMING_SIZE = 64 * 1024  # 64KB
+            if len(ev.data) > MAX_INCOMING_SIZE:
+                logger.error(f"Received data too large ({len(ev.data)} bytes), maximum is {MAX_INCOMING_SIZE} bytes")
+                return
+            
             data = json.loads(ev.data.decode('utf-8'))
             
             if data.get("type") == "user_configuration":
@@ -1843,25 +1960,18 @@ async def entrypoint(ctx: JobContext):
         except Exception as e:
             logger.error(f"❌ Error handling data message: {e}")
 
-    # Start the session with optimized settings for faster initialization
-    logger.info("🚀 Starting AgentSession with optimized settings...")
-    start_time = time.time()
-    
-    assistant = Assistant()
-    assistant._session = session  # Pass session to assistant for frontend communication
-    
-    await session.start(
-        agent=assistant,
-        room=ctx.room,
-    )
-    
-    elapsed = time.time() - start_time
-    logger.info(f"✅ AgentSession started successfully in {elapsed:.2f}s")
-
     # Join the room and connect to the user
     logger.info("🔗 Connecting to room...")
-    await ctx.connect()
-    logger.info("✅ Connected to room successfully")
+    try:
+        await ctx.connect()
+        logger.info("✅ Connected to room successfully")
+        logger.info(f"✅ Room connection established: {ctx.room.name}")
+        logger.info(f"✅ Room participants: {len(ctx.room.remote_participants)} remote participant(s)")
+    except Exception as e:
+        logger.error(f"❌ Failed to connect to room: {e}")
+        import traceback
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        raise
     
     # Send startup completion message to frontend
     try:
@@ -1900,20 +2010,34 @@ async def entrypoint(ctx: JobContext):
     # Keep the agent running by waiting for room events
     try:
         # Wait for room to be disconnected or other events
+        connection_check_count = 0
         while True:
             await asyncio.sleep(1)
+            connection_check_count += 1
+            
+            # Log connection health every 30 seconds
+            if connection_check_count % 30 == 0:
+                if hasattr(session, 'room') and session.room:
+                    logger.info(f"✅ Connection health check: Room '{session.room.name}' is active")
+                else:
+                    logger.warning("⚠️ Connection health check: Session room not available")
+            
             # Check if session has room attribute and if it's connected
             if hasattr(session, 'room') and session.room and hasattr(session.room, 'is_connected'):
                 if not session.room.is_connected:
-                    logger.info("Room disconnected, agent session ending")
+                    logger.warning("⚠️ Room disconnected, agent session ending")
                     break
             else:
                 # If no room attribute, just keep running
                 logger.debug("Session room not available, continuing...")
+    except asyncio.CancelledError:
+        logger.info("Agent session cancelled (normal shutdown)")
+        raise
     except Exception as e:
-        logger.error(f"Session ended with error: {e}")
+        logger.error(f"❌ Session ended with error: {e}")
         import traceback
         logger.error(f"Traceback: {traceback.format_exc()}")
+        raise
 
 
 # Health check app for deployment

@@ -27,6 +27,9 @@ import asyncpg
 import os
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from typing import Dict, List, Optional
+from enum import Enum
+from abc import ABC, abstractmethod
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -62,6 +65,10 @@ DB_CONFIG = {
 
 # Scheduler for scheduled briefing tasks
 scheduler = AsyncIOScheduler()
+
+# Database connection pool (initialized on first use)
+_db_pool = None
+_table_exists_cache = False
 
 load_dotenv(".env.local")
 
@@ -619,33 +626,200 @@ async def monitor_long_operation(session: AgentSession, intent_type: str, operat
         return None
 
 
-# Database Briefing Storage Functions
+# ============================================================================
+# ERROR MONITORING & NOTIFICATION SYSTEM
+# ============================================================================
+
+class ErrorSeverity(Enum):
+    CRITICAL = "CRITICAL"  # System down, data loss
+    HIGH = "HIGH"          # Major functionality broken
+    MEDIUM = "MEDIUM"      # Degraded performance
+    LOW = "LOW"            # Minor issues
+
+class NotificationChannel(ABC):
+    """Base class for notification channels"""
+    
+    @abstractmethod
+    async def send(self, error_record: Dict):
+        pass
+
+class EmailNotification(NotificationChannel):
+    """Email notification channel"""
+    
+    def __init__(self, smtp_server: str, smtp_port: int, 
+                 sender_email: str, sender_password: str,
+                 recipient_emails: List[str]):
+        self.smtp_server = smtp_server
+        self.smtp_port = smtp_port
+        self.sender_email = sender_email
+        self.sender_password = sender_password
+        self.recipient_emails = recipient_emails
+    
+    async def send(self, error_record: Dict):
+        """Send email notification"""
+        try:
+            # In production, use async SMTP library like aiosmtplib
+            logger.info(f"📧 Email notification would be sent: {error_record['error_type']} - {error_record['severity']}")
+            logger.info(f"   To: {', '.join(self.recipient_emails)}")
+            logger.info(f"   Subject: 🚨 HR Worker Alert: {error_record['error_type']} - {error_record['severity']}")
+        except Exception as e:
+            logger.error(f"Failed to send email notification: {e}")
+
+
+class ErrorMonitor:
+    """Centralized error monitoring and notification system"""
+    
+    def __init__(self):
+        self.error_counts: Dict[str, int] = {}
+        self.error_history: List[Dict] = []
+        self.alert_thresholds = {
+            ErrorSeverity.CRITICAL: 1,   # Email sent immediately on 1st occurrence
+            ErrorSeverity.HIGH: 3,        # Email sent after 3 occurrences
+            ErrorSeverity.MEDIUM: 5,      # Email sent after 5 occurrences
+            ErrorSeverity.LOW: 10         # Email sent after 10 occurrences
+        }
+        self.notification_channels: List[NotificationChannel] = []
+    
+    async def log_error(
+        self,
+        error_type: str,
+        message: str,
+        severity: ErrorSeverity,
+        context: Optional[Dict] = None,
+        exception: Optional[Exception] = None
+    ):
+        """Log error and trigger notifications if needed"""
+        error_key = f"{error_type}:{severity.value}"
+        self.error_counts[error_key] = self.error_counts.get(error_key, 0) + 1
+        
+        error_record = {
+            "timestamp": datetime.now().isoformat(),
+            "error_type": error_type,
+            "message": message,
+            "severity": severity.value,
+            "context": context or {},
+            "exception": str(exception) if exception else None,
+            "count": self.error_counts[error_key]
+        }
+        
+        self.error_history.append(error_record)
+        
+        # Keep only last 1000 errors
+        if len(self.error_history) > 1000:
+            self.error_history = self.error_history[-1000:]
+        
+        # Log the error
+        logger.error(f"[{severity.value}] {error_type}: {message}", exc_info=exception)
+        
+        # Check if we should send notification
+        threshold = self.alert_thresholds.get(severity, 10)
+        if self.error_counts[error_key] >= threshold:
+            await self.send_notification(error_record)
+    
+    async def send_notification(self, error_record: Dict):
+        """Send notification to configured channels"""
+        for channel in self.notification_channels:
+            try:
+                await channel.send(error_record)
+            except Exception as e:
+                logger.error(f"Failed to send notification via {channel}: {e}")
+
+# Global error monitor instance
+error_monitor = ErrorMonitor()
+
+def setup_notifications():
+    """Setup notification channels from environment variables (Email only)"""
+    # Email notifications only
+    if os.getenv("ALERT_EMAIL_FROM") and os.getenv("ALERT_EMAIL_TO"):
+        error_monitor.notification_channels.append(
+            EmailNotification(
+                smtp_server=os.getenv("SMTP_SERVER", "smtp.gmail.com"),
+                smtp_port=int(os.getenv("SMTP_PORT", "587")),
+                sender_email=os.getenv("ALERT_EMAIL_FROM"),
+                sender_password=os.getenv("ALERT_EMAIL_PASSWORD", ""),
+                recipient_emails=os.getenv("ALERT_EMAIL_TO", "").split(",")
+            )
+        )
+        logger.info("✅ Email notifications configured")
+    else:
+        logger.warning("⚠️ Email notifications not configured. Set ALERT_EMAIL_FROM and ALERT_EMAIL_TO environment variables to enable.")
+
+# Initialize notifications
+setup_notifications()
+
+# ============================================================================
+# DATABASE CONNECTION POOLING
+# ============================================================================
+
+async def get_db_pool():
+    """Get or create database connection pool"""
+    global _db_pool
+    if _db_pool is None:
+        try:
+            _db_pool = await asyncpg.create_pool(
+                **DB_CONFIG,
+                min_size=5,        # Minimum connections
+                max_size=20,       # Maximum connections
+                max_queries=50000,  # Max queries per connection
+                max_inactive_connection_lifetime=300,  # 5 minutes
+                command_timeout=60  # Query timeout
+            )
+            logger.info("✅ Database connection pool created")
+        except Exception as e:
+            await error_monitor.log_error(
+                error_type="DB_POOL_CREATE_FAILED",
+                message="Failed to create database connection pool",
+                severity=ErrorSeverity.CRITICAL,
+                exception=e
+            )
+            raise
+    return _db_pool
+
 async def get_db_connection():
-    """Get a database connection"""
-    return await asyncpg.connect(**DB_CONFIG)
+    """Get connection from pool (or create new if pool not available)"""
+    try:
+        pool = await get_db_pool()
+        return pool.acquire()
+    except Exception as e:
+        logger.warning(f"Connection pool not available, creating direct connection: {e}")
+        # Fallback to direct connection if pool fails
+        return await asyncpg.connect(**DB_CONFIG)
 
 async def ensure_briefing_table_exists():
-    """Ensure the briefing_cache table exists in the database"""
-    conn = await get_db_connection()
+    """Ensure the briefing_cache table exists in the database (cached)"""
+    global _table_exists_cache
+    if _table_exists_cache:
+        return
+    
     try:
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS briefing_cache (
-                id SERIAL PRIMARY KEY,
-                user_id VARCHAR(255) NOT NULL,
-                briefing_content TEXT NOT NULL,
-                cache_type VARCHAR(20) NOT NULL DEFAULT 'general',  -- 'morning', 'evening', or 'general'
-                cache_date DATE NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(user_id, cache_date, cache_type)
-            );
-            CREATE INDEX IF NOT EXISTS idx_briefing_cache_user_date ON briefing_cache(user_id, cache_date);
-        """)
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS briefing_cache (
+                    id SERIAL PRIMARY KEY,
+                    user_id VARCHAR(255) NOT NULL,
+                    briefing_content TEXT NOT NULL,
+                    cache_type VARCHAR(20) NOT NULL DEFAULT 'general',  -- 'morning', 'evening', or 'general'
+                    cache_date DATE NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(user_id, cache_date, cache_type)
+                );
+                CREATE INDEX IF NOT EXISTS idx_briefing_cache_user_date ON briefing_cache(user_id, cache_date);
+                CREATE INDEX IF NOT EXISTS idx_briefing_cache_user_date_type ON briefing_cache(user_id, cache_date, cache_type);
+                CREATE INDEX IF NOT EXISTS idx_briefing_cache_date_type ON briefing_cache(cache_date, cache_type);
+                CREATE INDEX IF NOT EXISTS idx_briefing_cache_updated_at ON briefing_cache(updated_at);
+            """)
+        _table_exists_cache = True
         logger.info("✅ Briefing cache table ensured to exist")
     except Exception as e:
+        await error_monitor.log_error(
+            error_type="TABLE_CREATION_FAILED",
+            message="Failed to ensure briefing_cache table exists",
+            severity=ErrorSeverity.HIGH,
+            exception=e
+        )
         logger.error(f"❌ Error ensuring briefing table exists: {e}")
-    finally:
-        await conn.close()
 
 async def save_briefing_to_db(user_id: str, briefing_content: str, cache_type: str = 'general'):
     """
@@ -657,25 +831,31 @@ async def save_briefing_to_db(user_id: str, briefing_content: str, cache_type: s
         cache_type: 'morning', 'evening', or 'general'
     """
     await ensure_briefing_table_exists()
-    conn = await get_db_connection()
+    pool = await get_db_pool()
     try:
-        today = datetime.now().date()
-        
-        # Use INSERT ... ON CONFLICT to update if record exists
-        await conn.execute("""
-            INSERT INTO briefing_cache (user_id, briefing_content, cache_type, cache_date, updated_at)
-            VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)
-            ON CONFLICT (user_id, cache_date, cache_type)
-            DO UPDATE SET
-                briefing_content = EXCLUDED.briefing_content,
-                updated_at = CURRENT_TIMESTAMP
-        """, user_id, briefing_content, cache_type, today)
-        
+        async with pool.acquire() as conn:
+            today = datetime.now().date()
+            
+            # Use INSERT ... ON CONFLICT to update if record exists
+            await conn.execute("""
+                INSERT INTO briefing_cache (user_id, briefing_content, cache_type, cache_date, updated_at)
+                VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)
+                ON CONFLICT (user_id, cache_date, cache_type)
+                DO UPDATE SET
+                    briefing_content = EXCLUDED.briefing_content,
+                    updated_at = CURRENT_TIMESTAMP
+            """, user_id, briefing_content, cache_type, today)
+            
         logger.info(f"✅ Briefing saved to database for user {user_id} (type: {cache_type})")
     except Exception as e:
-        logger.error(f"❌ Error saving briefing to database: {e}")
-    finally:
-        await conn.close()
+        await error_monitor.log_error(
+            error_type="DATABASE_SAVE_FAILED",
+            message=f"Failed to save briefing for user {user_id}",
+            severity=ErrorSeverity.HIGH,
+            context={"user_id": user_id, "cache_type": cache_type},
+            exception=e
+        )
+        raise
 
 async def user_has_briefing_in_db(user_id: str) -> bool:
     """
@@ -688,20 +868,25 @@ async def user_has_briefing_in_db(user_id: str) -> bool:
         True if user has a briefing record, False otherwise
     """
     await ensure_briefing_table_exists()
-    conn = await get_db_connection()
+    pool = await get_db_pool()
     try:
-        today = datetime.now().date()
-        result = await conn.fetchval("""
-            SELECT COUNT(*) 
-            FROM briefing_cache 
-            WHERE user_id = $1 AND cache_date = $2
-        """, user_id, today)
-        return result > 0 if result else False
+        async with pool.acquire() as conn:
+            today = datetime.now().date()
+            result = await conn.fetchval("""
+                SELECT COUNT(*) 
+                FROM briefing_cache 
+                WHERE user_id = $1 AND cache_date = $2
+            """, user_id, today)
+            return result > 0 if result else False
     except Exception as e:
-        logger.error(f"❌ Error checking if user has briefing: {e}")
+        await error_monitor.log_error(
+            error_type="DATABASE_CHECK_FAILED",
+            message=f"Failed to check if user has briefing: {user_id}",
+            severity=ErrorSeverity.MEDIUM,
+            context={"user_id": user_id},
+            exception=e
+        )
         return False
-    finally:
-        await conn.close()
 
 async def load_briefing_from_db(user_id: str, cache_type: str = None) -> str:
     """
@@ -715,65 +900,74 @@ async def load_briefing_from_db(user_id: str, cache_type: str = None) -> str:
         Briefing content if found, None otherwise
     """
     await ensure_briefing_table_exists()
-    conn = await get_db_connection()
+    pool = await get_db_pool()
     try:
-        today = datetime.now().date()
-        
-        if cache_type:
-            result = await conn.fetchrow("""
-                SELECT briefing_content, updated_at 
-                FROM briefing_cache 
-                WHERE user_id = $1 AND cache_date = $2 AND cache_type = $3
-                ORDER BY updated_at DESC
-                LIMIT 1
-            """, user_id, today, cache_type)
-        else:
-            # Get the most recent briefing for today (prefer evening, then morning, then general)
-            result = await conn.fetchrow("""
-                SELECT briefing_content, updated_at 
-                FROM briefing_cache 
-                WHERE user_id = $1 AND cache_date = $2
-                ORDER BY 
-                    CASE cache_type 
-                        WHEN 'evening' THEN 1
-                        WHEN 'morning' THEN 2
-                        ELSE 3
-                    END,
-                    updated_at DESC
-                LIMIT 1
-            """, user_id, today)
-        
-        if result:
-            logger.info(f"📋 Loaded briefing from database for user {user_id}")
-            return result['briefing_content']
-        else:
-            logger.debug(f"No briefing found in database for user {user_id} on {today}")
-            return None
+        async with pool.acquire() as conn:
+            today = datetime.now().date()
+            
+            if cache_type:
+                result = await conn.fetchrow("""
+                    SELECT briefing_content, updated_at 
+                    FROM briefing_cache 
+                    WHERE user_id = $1 AND cache_date = $2 AND cache_type = $3
+                    ORDER BY updated_at DESC
+                    LIMIT 1
+                """, user_id, today, cache_type)
+            else:
+                # Get the most recent briefing for today (prefer evening, then morning, then general)
+                result = await conn.fetchrow("""
+                    SELECT briefing_content, updated_at 
+                    FROM briefing_cache 
+                    WHERE user_id = $1 AND cache_date = $2
+                    ORDER BY 
+                        CASE cache_type 
+                            WHEN 'evening' THEN 1
+                            WHEN 'morning' THEN 2
+                            ELSE 3
+                        END,
+                        updated_at DESC
+                    LIMIT 1
+                """, user_id, today)
+            
+            if result:
+                logger.info(f"📋 Loaded briefing from database for user {user_id}")
+                return result['briefing_content']
+            else:
+                logger.debug(f"No briefing found in database for user {user_id} on {today}")
+                return None
     except Exception as e:
-        logger.error(f"❌ Error loading briefing from database: {e}")
+        await error_monitor.log_error(
+            error_type="DATABASE_LOAD_FAILED",
+            message=f"Failed to load briefing from database for user {user_id}",
+            severity=ErrorSeverity.MEDIUM,
+            context={"user_id": user_id, "cache_type": cache_type},
+            exception=e
+        )
         return None
-    finally:
-        await conn.close()
 
 async def get_all_active_users():
     """Get all active users from the database"""
-    conn = await get_db_connection()
+    pool = await get_db_pool()
     try:
-        # Get all users from the users table
-        # Adjust this query based on your actual users table structure
-        users = await conn.fetch("""
-            SELECT DISTINCT user_id 
-            FROM users 
-            WHERE user_id IS NOT NULL
-        """)
-        user_ids = [row['user_id'] for row in users]
-        logger.info(f"Found {len(user_ids)} active users in database")
-        return user_ids
+        async with pool.acquire() as conn:
+            # Get all users from the users table
+            # Adjust this query based on your actual users table structure
+            users = await conn.fetch("""
+                SELECT DISTINCT user_id 
+                FROM users 
+                WHERE user_id IS NOT NULL
+            """)
+            user_ids = [row['user_id'] for row in users]
+            logger.info(f"Found {len(user_ids)} active users in database")
+            return user_ids
     except Exception as e:
-        logger.error(f"❌ Error fetching active users: {e}")
+        await error_monitor.log_error(
+            error_type="DATABASE_FETCH_USERS_FAILED",
+            message="Failed to fetch active users from database",
+            severity=ErrorSeverity.HIGH,
+            exception=e
+        )
         return []
-    finally:
-        await conn.close()
 
 async def fetch_and_cache_briefing_for_user(user_id: str, cache_type: str = 'general'):
     """
@@ -791,8 +985,8 @@ async def fetch_and_cache_briefing_for_user(user_id: str, cache_type: str = 'gen
         assistant = Assistant()
         
         # Get user configuration - we'll need to fetch chatlog_id and agent_id from DB
-        conn = await get_db_connection()
-        try:
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
             user_config_query = await conn.fetchrow("""
                 SELECT user_id, tenant_id 
                 FROM users 
@@ -810,8 +1004,6 @@ async def fetch_and_cache_briefing_for_user(user_id: str, cache_type: str = 'gen
                 "agent_id": DEFAULT_AGENT_ID,
                 "tenant_id": user_config_query['tenant_id']
             }
-        finally:
-            await conn.close()
         
         # Generate JWT token
         jwt_token = await assistant._generate_jwt_token(user_id)
@@ -832,7 +1024,19 @@ async def fetch_and_cache_briefing_for_user(user_id: str, cache_type: str = 'gen
         timeout = httpx.Timeout(30.0, connect=10.0)
         async with httpx.AsyncClient(timeout=timeout) as client:
             response = await client.get(url, params=params, headers=headers)
-            response.raise_for_status()
+            
+            if response.status_code != 200:
+                await error_monitor.log_error(
+                    error_type="HR_API_ERROR",
+                    message=f"HR API returned error status {response.status_code} for user {user_id}",
+                    severity=ErrorSeverity.HIGH,
+                    context={
+                        "user_id": user_id,
+                        "status_code": response.status_code,
+                        "response_text": response.text[:200] if hasattr(response, 'text') else None
+                    }
+                )
+                response.raise_for_status()
             
             data = response.json()
             briefing_response = data.get("response", "No daily briefing available at this time")
@@ -848,10 +1052,33 @@ async def fetch_and_cache_briefing_for_user(user_id: str, cache_type: str = 'gen
             
             logger.info(f"✅ Briefing fetched and cached for user {user_id} (type: {cache_type})")
             
+    except httpx.TimeoutException as e:
+        await error_monitor.log_error(
+            error_type="HR_API_TIMEOUT",
+            message=f"HR API request timed out for user {user_id}",
+            severity=ErrorSeverity.MEDIUM,
+            context={"user_id": user_id, "cache_type": cache_type},
+            exception=e
+        )
+        raise
+    except httpx.RequestError as e:
+        await error_monitor.log_error(
+            error_type="HR_API_REQUEST_FAILED",
+            message=f"HR API request failed for user {user_id}",
+            severity=ErrorSeverity.HIGH,
+            context={"user_id": user_id, "cache_type": cache_type},
+            exception=e
+        )
+        raise
     except Exception as e:
-        logger.error(f"❌ Error fetching briefing for user {user_id}: {e}")
-        import traceback
-        logger.error(f"Traceback: {traceback.format_exc()}")
+        await error_monitor.log_error(
+            error_type="BRIEFING_FETCH_FAILED",
+            message=f"Error fetching briefing for user {user_id}",
+            severity=ErrorSeverity.HIGH,
+            context={"user_id": user_id, "cache_type": cache_type},
+            exception=e
+        )
+        raise
 
 async def scheduled_briefing_task(cache_type: str):
     """
@@ -861,31 +1088,87 @@ async def scheduled_briefing_task(cache_type: str):
         cache_type: 'morning' (5 AM) or 'evening' (5 PM)
     """
     logger.info(f"⏰ Starting scheduled briefing task ({cache_type})")
+    task_start_time = datetime.now()
+    success_count = 0
+    failure_count = 0
     
     try:
         # Get all active users
         user_ids = await get_all_active_users()
         
         if not user_ids:
-            logger.warning("No active users found for briefing generation")
+            await error_monitor.log_error(
+                error_type="SCHEDULED_TASK_NO_USERS",
+                message="No active users found for briefing generation",
+                severity=ErrorSeverity.LOW,
+                context={"cache_type": cache_type}
+            )
             return
         
-        # Fetch briefings for all users concurrently (with limit to avoid overwhelming the API)
-        # Process in batches to avoid rate limits
-        batch_size = 10
+        # Adaptive batch size based on user count
+        if len(user_ids) > 100:
+            batch_size = 20
+            delay = 1
+        elif len(user_ids) > 50:
+            batch_size = 15
+            delay = 1.5
+        else:
+            batch_size = 10
+            delay = 2
+        
+        # Use semaphore to limit concurrent API calls
+        semaphore = asyncio.Semaphore(20)  # Max 20 concurrent
+        
+        async def fetch_with_limit(user_id):
+            async with semaphore:
+                try:
+                    await fetch_and_cache_briefing_for_user(user_id, cache_type)
+                    return True
+                except Exception:
+                    return False
+        
+        # Process in batches
         for i in range(0, len(user_ids), batch_size):
             batch = user_ids[i:i + batch_size]
-            tasks = [fetch_and_cache_briefing_for_user(user_id, cache_type) for user_id in batch]
-            await asyncio.gather(*tasks, return_exceptions=True)
+            tasks = [fetch_with_limit(user_id) for user_id in batch]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            # Count successes and failures
+            for result in results:
+                if result is True:
+                    success_count += 1
+                else:
+                    failure_count += 1
+            
             # Small delay between batches
-            await asyncio.sleep(2)
+            await asyncio.sleep(delay)
         
-        logger.info(f"✅ Scheduled briefing task completed ({cache_type}) for {len(user_ids)} users")
+        # Log summary
+        if failure_count > 0:
+            await error_monitor.log_error(
+                error_type="SCHEDULED_TASK_PARTIAL_FAILURE",
+                message=f"Scheduled task completed with {failure_count} failures out of {len(user_ids)} users",
+                severity=ErrorSeverity.MEDIUM if failure_count < len(user_ids) * 0.1 else ErrorSeverity.HIGH,
+                context={
+                    "cache_type": cache_type,
+                    "total_users": len(user_ids),
+                    "success_count": success_count,
+                    "failure_count": failure_count
+                }
+            )
+        
+        elapsed = (datetime.now() - task_start_time).total_seconds()
+        logger.info(f"✅ Scheduled briefing task completed ({cache_type}) for {len(user_ids)} users in {elapsed:.2f}s (Success: {success_count}, Failed: {failure_count})")
         
     except Exception as e:
-        logger.error(f"❌ Error in scheduled briefing task: {e}")
-        import traceback
-        logger.error(f"Traceback: {traceback.format_exc()}")
+        await error_monitor.log_error(
+            error_type="SCHEDULED_TASK_CRITICAL_FAILURE",
+            message=f"Scheduled briefing task failed completely for {cache_type}",
+            severity=ErrorSeverity.CRITICAL,
+            context={"cache_type": cache_type},
+            exception=e
+        )
+        raise
 
 def start_scheduled_briefing_tasks():
     """Start the scheduled briefing tasks for 5 AM and 5 PM"""
@@ -1246,28 +1529,35 @@ class Assistant(Agent):
     # Function to fetch user details from the database
     async def fetch_user_details_from_db(self, user_id: str) -> dict:
         """Fetch tenant_id using user_id from the database."""
-        conn = await asyncpg.connect(
-            user='AN24_Acabot', 
-            password='lAyWkB5FIXghQpvNYM5ggpITC',
-            database='acabotdb-dev', 
-            host='acabot-dbcluster-dev.cluster-cp2eea8yihxz.us-east-1.rds.amazonaws.com',
-            port=5432
-        )
+        pool = await get_db_pool()
         try:
-            query = "SELECT tenant_id FROM users WHERE user_id = $1"
-            result = await conn.fetchrow(query, user_id)
-            logger.debug(f"Database query result: {result}")
+            async with pool.acquire() as conn:
+                query = "SELECT tenant_id FROM users WHERE user_id = $1"
+                result = await conn.fetchrow(query, user_id)
+                logger.debug(f"Database query result: {result}")
 
-            if result:
-                return {
-                    "user_id": user_id,
-                    "tenant_id": result["tenant_id"]
-                }
-            else:
-                logger.error("No tenant found for the given user_id.")
-                raise ValueError("Tenant not found")
-        finally:
-            await conn.close()
+                if result:
+                    return {
+                        "user_id": user_id,
+                        "tenant_id": result["tenant_id"]
+                    }
+                else:
+                    await error_monitor.log_error(
+                        error_type="TENANT_NOT_FOUND",
+                        message=f"No tenant found for user_id: {user_id}",
+                        severity=ErrorSeverity.MEDIUM,
+                        context={"user_id": user_id}
+                    )
+                    raise ValueError("Tenant not found")
+        except Exception as e:
+            await error_monitor.log_error(
+                error_type="FETCH_USER_DETAILS_FAILED",
+                message=f"Failed to fetch user details for user_id: {user_id}",
+                severity=ErrorSeverity.HIGH,
+                context={"user_id": user_id},
+                exception=e
+            )
+            raise
 
     # Update _generate_jwt_token to use this function
     async def _generate_jwt_token(self, user_email: str) -> str:
@@ -2055,6 +2345,48 @@ async def health_check():
 @health_app.get("/")
 async def root():
     return {"message": "HR Voice Assistant is running"}
+
+async def monitor_db_pool_health():
+    """Monitor database connection pool health"""
+    try:
+        pool = await get_db_pool()
+        
+        # Get pool statistics
+        pool_stats = {
+            "size": pool.get_size(),
+            "idle": pool.get_idle_size(),
+            "min_size": pool.get_min_size(),
+            "max_size": pool.get_max_size()
+        }
+        
+        # Check for issues
+        if pool_stats["idle"] == 0 and pool_stats["size"] == pool_stats["max_size"]:
+            await error_monitor.log_error(
+                error_type="DB_POOL_EXHAUSTED",
+                message="Database connection pool exhausted",
+                severity=ErrorSeverity.HIGH,
+                context=pool_stats
+            )
+        
+        if pool_stats["size"] < pool_stats["min_size"]:
+            await error_monitor.log_error(
+                error_type="DB_POOL_BELOW_MIN",
+                message="Database connection pool below minimum size",
+                severity=ErrorSeverity.MEDIUM,
+                context=pool_stats
+            )
+        
+        # Health check
+        async with pool.acquire() as conn:
+            await conn.fetchval("SELECT 1")
+            
+    except Exception as e:
+        await error_monitor.log_error(
+            error_type="DB_POOL_HEALTH_CHECK_FAILED",
+            message="Database connection pool health check failed",
+            severity=ErrorSeverity.CRITICAL,
+            exception=e
+        )
 
 def start_health_server():
     """Start the health check server in a separate thread"""

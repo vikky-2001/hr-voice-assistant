@@ -1403,13 +1403,13 @@ async def send_automatic_greeting(session: AgentSession, assistant: 'Assistant')
         user_config = get_user_config()
         user_name = user_config.get("user_name", "there")
         
-        # Create personalized greeting messages
+        # Create simple, focused greeting messages (briefing will come after)
         greeting_options = [
-            f"Hello! I'm your HR assistant. How can I help you today?",
-            f"Hi! Welcome to your HR assistant. What can I do for you?",
-            f"Good day! I'm here to help with any HR questions you might have.",
-            f"Hello! Your HR assistant is ready to assist you. How may I help?",
-            f"Hi there! I can help you with company policies, benefits, leave requests, and more. What would you like to know?"
+            f"Hello! I'm your HR assistant.",
+            f"Hi! Welcome to your HR assistant.",
+            f"Good day! I'm your HR assistant.",
+            f"Hello! Your HR assistant is ready.",
+            f"Hi there! I'm your HR assistant."
         ]
         
         # Select a greeting (you could randomize this or use time-based selection)
@@ -1433,15 +1433,15 @@ async def send_automatic_greeting(session: AgentSession, assistant: 'Assistant')
         
         # Actually speak the greeting using the session's say method with better error handling
         try:
-            # Add a small pause before speaking for better audio quality
-            await asyncio.sleep(0.3)
+            # Minimal pause for TTS initialization
+            await asyncio.sleep(0.1)
             await session.say(greeting)
             logger.info("✅ Automatic greeting spoken successfully")
         except Exception as e:
             logger.warning(f"Could not speak automatic greeting: {e}")
             # Try a simpler fallback greeting
             try:
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(0.1)
                 await session.say(f"Hello! Your HR assistant is ready to help.")
                 logger.info("✅ Fallback greeting spoken successfully")
             except Exception as fallback_e:
@@ -1461,7 +1461,11 @@ class Assistant(Agent):
         super().__init__(
             instructions="""You are an HR assistant voice AI that helps employees with HR-related questions.
             
-            AUTOMATIC GREETING: When a user first connects, you should immediately call send_connection_greeting() to welcome them proactively. This creates a welcoming experience before they even speak.
+            AUTOMATIC GREETING: When a user first connects, you MUST:
+            1. First call send_connection_greeting() to welcome them proactively with a warm greeting
+            2. Then immediately call get_daily_briefing() to get their briefing
+            3. Then speak the briefing naturally: "Here's your daily briefing: [briefing content]. How can I help you today?"
+            4. Do this as ONE continuous flow - greeting, then briefing, all in sequence
             
             SMART CONVERSATION FLOW: You now have intelligent intent classification and conversation memory for optimal user experience.
             
@@ -1486,10 +1490,12 @@ class Assistant(Agent):
             - For follow-up questions like "What about sick leave?" it refers to previous context
             - Conversation memory helps provide more personalized responses
             
-            DAILY BRIEFING PROTOCOL: When you receive the message "System trigger: daily briefing", you must:
-            1. Immediately call get_daily_briefing() to retrieve their daily briefing information
-            2. Then greet them warmly with: "Hello! I'm your HR assistant. Here's your daily briefing: [provide the briefing content in a clear, organized way]. How can I help you today? You can ask me about company policies, benefits, leave requests, HR workflows, or any other HR-related questions."
-            3. When presenting the briefing, make it engaging and easy to understand - don't just read it robotically
+            DAILY BRIEFING PROTOCOL: When a user first connects, you should:
+            1. First call send_connection_greeting() to greet them warmly
+            2. Then immediately call get_daily_briefing() to retrieve their daily briefing information
+            3. After getting the briefing, speak it naturally: "Here's your daily briefing: [provide the briefing content in a clear, organized way]. How can I help you today?"
+            4. When presenting the briefing, make it engaging and easy to understand - don't just read it robotically
+            5. IMPORTANT: Do NOT say "let me get your daily briefing" - just get it and present it directly
             
             IMPORTANT: 
             - Call send_connection_greeting() when user first connects (proactive greeting)
@@ -1508,7 +1514,16 @@ class Assistant(Agent):
             - Never say "I cannot provide" unless you truly have no information - always try to be helpful
             - For company policies, workflows, and HR information, share whatever information the HR system provides by SPEAKING it
             - Be proactive in helping users understand HR processes and policies
-            - Remember: Your responses are automatically converted to speech via TTS, so generate natural spoken text""",
+            - Remember: Your responses are automatically converted to speech via TTS, so generate natural spoken text
+            
+            CRITICAL SPEECH FLOW REQUIREMENTS:
+            - ALWAYS generate responses as SINGLE CONTINUOUS statements - never break responses into separate sentences with pauses
+            - When speaking, combine all related thoughts into ONE flowing response without stopping between sentences
+            - For example, instead of saying "Hello mobile user." [pause] "How can I help you today?" [pause] "Let me get your daily briefing."
+            - Say: "Hello mobile user! How can I help you today? Let me get your daily briefing."
+            - Generate responses that flow naturally from start to finish without artificial breaks
+            - The TTS will handle natural pauses automatically - you don't need to create separate statements
+            - Think of your responses as a continuous stream of speech, not separate statements""",
         )
         
         # Initialize conversation memory
@@ -1789,6 +1804,9 @@ class Assistant(Agent):
         try:
             logger.info("=== get_daily_briefing_with_speech() called ===")
             
+            # Wait a moment after greeting before starting briefing
+            await asyncio.sleep(1.0)
+            
             # Check cache first for instant response
             cached_briefing = get_cached_briefing()
             session = getattr(self, '_session', None)
@@ -1797,42 +1815,40 @@ class Assistant(Agent):
                 # Instant response with cached briefing
                 logger.info("🚀 Speaking cached briefing instantly")
                 try:
-                    await asyncio.sleep(0.2)  # Small pause for better audio quality
-                    await session.say(f"Here's your daily briefing: {cached_briefing}")
+                    await session.say(f"Here's your daily briefing: {cached_briefing}. How can I help you today?")
                     logger.info("✅ Cached daily briefing spoken successfully")
                 except Exception as e:
                     logger.error(f"Error speaking cached briefing: {e}")
                 return
             
             # No cache available, fetch fresh briefing
-            if session:
-                try:
-                    await asyncio.sleep(0.2)  # Small pause for better audio quality
-                    await session.say("Let me get your daily briefing for you.")
-                except Exception as e:
-                    logger.warning(f"Error speaking briefing prompt: {e}")
-            
             # Get the briefing content with timeout
             try:
                 briefing_content = await asyncio.wait_for(self.get_daily_briefing(), timeout=20.0)
+                logger.info("✅ Daily briefing retrieved successfully")
+                
+                # Speak the briefing to the user
+                if session and briefing_content:
+                    try:
+                        logger.info("Speaking daily briefing to user")
+                        await session.say(f"Here's your daily briefing: {briefing_content}. How can I help you today?")
+                        logger.info("Daily briefing spoken successfully")
+                    except Exception as e:
+                        logger.error(f"Error speaking daily briefing: {e}")
             except asyncio.TimeoutError:
                 logger.warning("Daily briefing request timed out, using fallback")
-                briefing_content = "I'm having trouble connecting to the HR system right now. Your daily briefing will be available shortly. In the meantime, feel free to ask me any HR questions!"
+                if session:
+                    try:
+                        await session.say("I'm having trouble connecting to the HR system right now. Your daily briefing will be available shortly. How can I help you today?")
+                    except Exception as e:
+                        logger.error(f"Error speaking fallback message: {e}")
             except Exception as e:
                 logger.error(f"Error fetching daily briefing: {e}")
-                briefing_content = "I'm having trouble retrieving your daily briefing right now. Please try again later or ask me any HR questions!"
-            
-            # Speak the briefing to the user with better timing
-            if session and briefing_content:
-                try:
-                    logger.info("Speaking daily briefing to user")
-                    await asyncio.sleep(0.3)  # Pause for better audio quality
-                    await session.say(f"Here's your daily briefing: {briefing_content}")
-                    logger.info("Daily briefing spoken successfully")
-                except Exception as e:
-                    logger.error(f"Error speaking daily briefing: {e}")
-            else:
-                logger.warning("No session or briefing content available for speech")
+                if session:
+                    try:
+                        await session.say("I'm having trouble retrieving your daily briefing right now. How can I help you today?")
+                    except Exception as e:
+                        logger.error(f"Error speaking error message: {e}")
                 
         except Exception as e:
             logger.error(f"Error in get_daily_briefing_with_speech: {e}")

@@ -336,7 +336,12 @@ def update_user_config_from_frontend(config_data: dict):
         
     except (ValueError, TypeError) as e:
         logger.error(f"❌ Error updating user config from frontend: {e}")
-        logger.error(f"❌ Invalid config data: {config_data}")
+        # Truncate long config data in logs to avoid scanner errors
+        config_str = str(config_data)
+        if len(config_str) > 500:
+            logger.error(f"❌ Invalid config data: {config_str[:500]}... (truncated, {len(config_str)} total)")
+        else:
+            logger.error(f"❌ Invalid config data: {config_str}")
 
 def lookup_user_by_room(room_name: str) -> str:
     """
@@ -870,14 +875,15 @@ class Assistant(Agent):
     # Function to fetch user details from the database
     async def fetch_user_details_from_db(self, user_id: str) -> dict:
         """Fetch tenant_id using user_id from the database."""
-        conn = await asyncpg.connect(
-            user='AN24_Acabot', 
-            password='lAyWkB5FIXghQpvNYM5ggpITC',
-            database='acabotdb-dev', 
-            host='acabot-dbcluster-dev.cluster-cp2eea8yihxz.us-east-1.rds.amazonaws.com',
-            port=5432
-        )
+        conn = None
         try:
+            conn = await asyncpg.connect(
+                user='AN24_Acabot', 
+                password='lAyWkB5FIXghQpvNYM5ggpITC',
+                database='acabotdb-dev', 
+                host='acabot-dbcluster-dev.cluster-cp2eea8yihxz.us-east-1.rds.amazonaws.com',
+                port=5432
+            )
             query = "SELECT tenant_id FROM users WHERE user_id = $1"
             result = await conn.fetchrow(query, user_id)
             logger.debug(f"Database query result: {result}")
@@ -890,41 +896,54 @@ class Assistant(Agent):
             else:
                 logger.error("No tenant found for the given user_id.")
                 raise ValueError("Tenant not found")
+        except Exception as e:
+            logger.error(f"Database error fetching user details: {e}")
+            # Re-raise to let caller handle it, but log the error
+            raise
         finally:
-            await conn.close()
+            if conn:
+                try:
+                    await conn.close()
+                except Exception as e:
+                    logger.warning(f"Error closing database connection: {e}")
 
     # Update _generate_jwt_token to use this function
     async def _generate_jwt_token(self, user_email: str) -> str:
         """Generate JWT token for HR Worker API authentication."""
-        user_details = await self.fetch_user_details_from_db(user_email)
-        final_user_id = user_details["user_id"]
-        final_tenant_id = user_details["tenant_id"]
+        try:
+            user_details = await self.fetch_user_details_from_db(user_email)
+            final_user_id = user_details["user_id"]
+            final_tenant_id = user_details["tenant_id"]
 
-        # Create payload with issued at and expiration time
-        now = datetime.now(timezone.utc)
-        issued_at = int(now.timestamp())
-        expiration_time = now + timedelta(minutes=30)
-        expires_at = int(expiration_time.timestamp())
+            # Create payload with issued at and expiration time
+            now = datetime.now(timezone.utc)
+            issued_at = int(now.timestamp())
+            expiration_time = now + timedelta(minutes=30)
+            expires_at = int(expiration_time.timestamp())
 
-        payload = {
-            "user_id": final_user_id,
-            "tenant_id": final_tenant_id,
-            "iat": issued_at,
-            "exp": expires_at
-        }
+            payload = {
+                "user_id": final_user_id,
+                "tenant_id": final_tenant_id,
+                "iat": issued_at,
+                "exp": expires_at
+            }
 
-        token = jwt.encode(
-            payload,
-            "missionmind-dev", # Replace with actual JWT secret
-            algorithm="HS256" # Replace with actual algorithm
-        )
+            token = jwt.encode(
+                payload,
+                "missionmind-dev", # Replace with actual JWT secret
+                algorithm="HS256" # Replace with actual algorithm
+            )
 
-        # Log the generated token with limited visibility for debugging
-        logger.info(f"Generated JWT token (partial): {token[:10]}...{token[-10:]}")
-        logger.info(f"Generated JWT token for user: {final_user_id} with expiry at {expires_at}")
-        # Log the full generated token for debugging
-        logger.info(f"Generated JWT token: {token}")
-        return token
+            # Log the generated token with limited visibility for debugging
+            logger.info(f"Generated JWT token (partial): {token[:10]}...{token[-10:]}")
+            logger.info(f"Generated JWT token for user: {final_user_id} with expiry at {expires_at}")
+            # Log the full generated token for debugging
+            logger.info(f"Generated JWT token: {token}")
+            return token
+        except Exception as e:
+            logger.error(f"Error generating JWT token: {e}")
+            # Re-raise to let caller handle it
+            raise
 
     # all functions annotated with @function_tool will be passed to the LLM when this
     # agent is active
@@ -1072,15 +1091,21 @@ class Assistant(Agent):
             if cached_briefing and session:
                 # Instant response with cached briefing
                 logger.info("🚀 Speaking cached briefing instantly")
-                await asyncio.sleep(0.2)  # Small pause for better audio quality
-                await session.say(f"Here's your daily briefing: {cached_briefing}")
-                logger.info("✅ Cached daily briefing spoken successfully")
+                try:
+                    await asyncio.sleep(0.2)  # Small pause for better audio quality
+                    await session.say(f"Here's your daily briefing: {cached_briefing}")
+                    logger.info("✅ Cached daily briefing spoken successfully")
+                except Exception as e:
+                    logger.error(f"Error speaking cached briefing: {e}")
                 return
             
             # No cache available, fetch fresh briefing
             if session:
-                await asyncio.sleep(0.2)  # Small pause for better audio quality
-                await session.say("Let me get your daily briefing for you.")
+                try:
+                    await asyncio.sleep(0.2)  # Small pause for better audio quality
+                    await session.say("Let me get your daily briefing for you.")
+                except Exception as e:
+                    logger.warning(f"Error speaking briefing prompt: {e}")
             
             # Get the briefing content with timeout
             try:
@@ -1088,18 +1113,31 @@ class Assistant(Agent):
             except asyncio.TimeoutError:
                 logger.warning("Daily briefing request timed out, using fallback")
                 briefing_content = "I'm having trouble connecting to the HR system right now. Your daily briefing will be available shortly. In the meantime, feel free to ask me any HR questions!"
+            except Exception as e:
+                logger.error(f"Error fetching daily briefing: {e}")
+                briefing_content = "I'm having trouble retrieving your daily briefing right now. Please try again later or ask me any HR questions!"
             
             # Speak the briefing to the user with better timing
             if session and briefing_content:
-                logger.info("Speaking daily briefing to user")
-                await asyncio.sleep(0.3)  # Pause for better audio quality
-                await session.say(f"Here's your daily briefing: {briefing_content}")
-                logger.info("Daily briefing spoken successfully")
+                try:
+                    logger.info("Speaking daily briefing to user")
+                    await asyncio.sleep(0.3)  # Pause for better audio quality
+                    await session.say(f"Here's your daily briefing: {briefing_content}")
+                    logger.info("Daily briefing spoken successfully")
+                except Exception as e:
+                    logger.error(f"Error speaking daily briefing: {e}")
             else:
                 logger.warning("No session or briefing content available for speech")
                 
         except Exception as e:
             logger.error(f"Error in get_daily_briefing_with_speech: {e}")
+            import traceback
+            # Truncate long tracebacks to avoid scanner errors
+            tb_str = traceback.format_exc()
+            if len(tb_str) > 500:
+                logger.error(f"Traceback: {tb_str[:500]}... (truncated)")
+            else:
+                logger.error(f"Traceback: {tb_str}")
             # Fallback: speak a simple message
             try:
                 session = getattr(self, '_session', None)
@@ -1107,6 +1145,7 @@ class Assistant(Agent):
                     await session.say("I'm preparing your daily briefing. Please give me a moment.")
             except Exception as fallback_error:
                 logger.error(f"Fallback speech error: {fallback_error}")
+                # Don't raise - just log and continue
 
     @function_tool
     async def query_hr_system(self, query: str):
@@ -1181,7 +1220,12 @@ class Assistant(Agent):
                 
                 # Validate the response
                 if not hr_response or hr_response.strip() == "":
-                    logger.warning(f"HR API returned empty response. Full data: {data}")
+                    # Truncate long data in logs to avoid scanner errors
+                    data_str = str(data)
+                    if len(data_str) > 500:
+                        logger.warning(f"HR API returned empty response. Full data: {data_str[:500]}... (truncated, {len(data_str)} total)")
+                    else:
+                        logger.warning(f"HR API returned empty response. Full data: {data_str}")
                     if monitor_task:
                         monitor_task.cancel()
                     return "I'm sorry, I didn't receive a response from the HR system for that question. Could you please rephrase your question or try asking about a specific topic?"
@@ -1322,9 +1366,14 @@ class Assistant(Agent):
 
 async def process_audio_with_noise_cancellation(audio_data):
     """Apply noise cancellation to audio data"""
-    # Perform noise reduction
-    reduced_noise_audio = nr.reduce_noise(y=audio_data, sr=16000)
-    return reduced_noise_audio
+    try:
+        # Perform noise reduction
+        reduced_noise_audio = nr.reduce_noise(y=audio_data, sr=16000)
+        return reduced_noise_audio
+    except Exception as e:
+        logger.warning(f"Error in noise cancellation, using original audio: {e}")
+        # Return original audio if noise cancellation fails
+        return audio_data
 
 
 def prewarm(proc: JobProcess):
@@ -1422,23 +1471,33 @@ async def entrypoint(ctx: JobContext):
     # Handle false positive interruptions
     @session.on("agent_false_interruption")
     def _on_agent_false_interruption(ev):
-        logger.info("Detected false positive interruption, resuming")
-        session.generate_reply(instructions=ev.extra_instructions or None)
+        try:
+            logger.info("Detected false positive interruption, resuming")
+            session.generate_reply(instructions=ev.extra_instructions or None)
+        except Exception as e:
+            logger.error(f"Error handling false interruption: {e}")
+            # Continue running - don't let interruption handling failures stop the agent
     
     # Send user speech to frontend as text
     async def process_audio(raw_audio, ev):
-        processed_audio = await process_audio_with_noise_cancellation(raw_audio)
-        stt_result = await session.stt.recognize(processed_audio)
-        await send_text_to_frontend(
-            session=session,
-            message_type="user_speech",
-            content=stt_result,
-            metadata={"source": "user_speech", "timestamp": ev.timestamp}
-        )
+        try:
+            processed_audio = await process_audio_with_noise_cancellation(raw_audio)
+            stt_result = await session.stt.recognize(processed_audio)
+            await send_text_to_frontend(
+                session=session,
+                message_type="user_speech",
+                content=stt_result,
+                metadata={"source": "user_speech", "timestamp": ev.timestamp}
+            )
+        except Exception as e:
+            logger.error(f"Error in process_audio: {e}")
+            # Continue running - don't let audio processing failures stop the agent
 
     @session.on("user_speech_committed")
     def _on_user_speech_committed(ev):
-        logger.info(f"User speech committed: {ev.text}")
+        # Truncate long text in logs to avoid scanner errors
+        text_preview = ev.text[:200] + "..." if len(ev.text) > 200 else ev.text
+        logger.info(f"User speech committed: {text_preview}")
         try:
             if hasattr(session, 'room') and session.room:
                 raw_audio = ev.audio
@@ -1474,7 +1533,9 @@ async def entrypoint(ctx: JobContext):
     # Send live transcripts as the agent speaks (real-time)
     @session.on("agent_speech_partial")
     def _on_agent_speech_partial(ev):
-        logger.info(f"Agent speech partial: {ev.text}")
+        # Truncate long text in logs to avoid scanner errors
+        text_preview = ev.text[:200] + "..." if len(ev.text) > 200 else ev.text
+        logger.info(f"Agent speech partial: {text_preview}")
         try:
             if hasattr(session, 'room') and session.room:
                 asyncio.create_task(send_text_to_frontend(
@@ -1491,7 +1552,9 @@ async def entrypoint(ctx: JobContext):
     # Send user speech partial transcripts (real-time)
     @session.on("user_speech_partial")
     def _on_user_speech_partial(ev):
-        logger.info(f"User speech partial: {ev.text}")
+        # Truncate long text in logs to avoid scanner errors
+        text_preview = ev.text[:200] + "..." if len(ev.text) > 200 else ev.text
+        logger.info(f"User speech partial: {text_preview}")
         try:
             if hasattr(session, 'room') and session.room:
                 asyncio.create_task(send_text_to_frontend(
@@ -1508,10 +1571,11 @@ async def entrypoint(ctx: JobContext):
     # Handle data channel messages from frontend
     @session.on("data_received")
     def _on_data_received(ev):
-        # Truncate log message to prevent very long log lines
-        data_preview = ev.data[:100] + b"..." if len(ev.data) > 100 else ev.data
-        logger.info(f"Data received from frontend: {data_preview}...")
         try:
+            # Truncate log message to prevent very long log lines
+            data_preview = ev.data[:100] + b"..." if len(ev.data) > 100 else ev.data
+            logger.info(f"Data received from frontend: {data_preview}...")
+            
             import json
             # Safety check: limit incoming data size to prevent scanner errors
             MAX_INCOMING_SIZE = 64 * 1024  # 64KB
@@ -1523,15 +1587,18 @@ async def entrypoint(ctx: JobContext):
             
             if data.get("type") == "user_configuration":
                 logger.info("📥 Received user configuration from frontend")
-                update_user_config_from_frontend(data)
-                
-                # Send confirmation back to frontend
-                asyncio.create_task(send_text_to_frontend(
-                    session=session,
-                    message_type="user_config_confirmation",
-                    content=f"User configuration received: {data.get('user_name', 'Unknown User')}",
-                    metadata={"source": "agent", "config_received": True}
-                ))
+                try:
+                    update_user_config_from_frontend(data)
+                    
+                    # Send confirmation back to frontend
+                    asyncio.create_task(send_text_to_frontend(
+                        session=session,
+                        message_type="user_config_confirmation",
+                        content=f"User configuration received: {data.get('user_name', 'Unknown User')}",
+                        metadata={"source": "agent", "config_received": True}
+                    ))
+                except Exception as e:
+                    logger.error(f"Error processing user configuration: {e}")
             else:
                 logger.info(f"📥 Received other data message: {data.get('type', 'unknown')}")
                 
@@ -1539,6 +1606,7 @@ async def entrypoint(ctx: JobContext):
             logger.error(f"❌ Error parsing data message: {e}")
         except Exception as e:
             logger.error(f"❌ Error handling data message: {e}")
+            # Continue running - don't let data channel errors stop the agent
 
     # Join the room and connect to the user
     logger.info("🔗 Connecting to room...")
@@ -1570,7 +1638,11 @@ async def entrypoint(ctx: JobContext):
         logger.warning(f"Could not send startup completion message: {e}")
     
     # Send automatic greeting after successful connection
-    await send_automatic_greeting(session, assistant)
+    try:
+        await send_automatic_greeting(session, assistant)
+    except Exception as e:
+        logger.error(f"Error sending automatic greeting: {e}")
+        # Continue running - don't let greeting failures stop the agent
     
     # Trigger the daily briefing in background (non-blocking) with automatic speech
     logger.info("Session started, triggering daily briefing in background")
@@ -1614,10 +1686,18 @@ async def entrypoint(ctx: JobContext):
         logger.info("Agent session cancelled (normal shutdown)")
         raise
     except Exception as e:
-        logger.error(f"❌ Session ended with error: {e}")
+        logger.error(f"❌ Error in main loop: {e}")
         import traceback
-        logger.error(f"Traceback: {traceback.format_exc()}")
-        raise
+        # Truncate long tracebacks to avoid scanner errors
+        tb_str = traceback.format_exc()
+        if len(tb_str) > 1000:
+            logger.error(f"Traceback: {tb_str[:1000]}... (truncated)")
+        else:
+            logger.error(f"Traceback: {tb_str}")
+        # Continue running instead of raising - agent should stay alive
+        logger.info("🔄 Continuing agent operation despite error...")
+        # Wait a bit before continuing to avoid tight error loops
+        await asyncio.sleep(1)
 
 
 # Health check app for deployment
